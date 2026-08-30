@@ -1,5 +1,7 @@
 # pi-interactive-subagents
 
+**main branch is (likely out of date) upstream, my changes live in local_changes branch**
+
 Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
 **tmux-only fork.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
