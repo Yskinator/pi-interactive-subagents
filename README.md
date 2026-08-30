@@ -2,7 +2,7 @@
 
 Async subagents for [pi](https://github.com/badlogic/pi-mono), running in tmux panes. Spawn a sub-agent, keep working in the main session, and get the result steered back when it finishes. Fully non-blocking.
 
-**tmux-only fork.** See [Acknowledgements](#acknowledgements) for the upstream project, which also supports cmux, zellij, and WezTerm.
+**my personal fork of a tmux-only fork.** See [Acknowledgements](#acknowledgements) for the upstream projects.
 
 ## How it works
 
@@ -221,7 +221,8 @@ tmux new -A -s pi 'pi'
 
 ## Acknowledgements
 
-Forked from [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), which originated the subagent architecture, the multi-multiplexer surface layer, and the status widget; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/).
+Forker from [amosblomqvist/pi-interactive-subagents](https://github.com/amosblomqvist/pi-interactive-subagents). I've since added sub-agent chains, a reviewer agents, and bundled web search tools. I yoinked the last two from here [amosblomqviest/pi-config](https://github.com/amosblomqvist/pi-config/) and tweaked them to suit my needs. I also made the sub-agents use my local vllm server instead of cloud models.
+amosblomqviest/pi-interactive-subagents was forked from from [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), which originated the subagent architecture, the multi-multiplexer surface layer, and the status widget; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/).
 
 ## License
 
