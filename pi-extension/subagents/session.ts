@@ -114,6 +114,16 @@ export interface SubagentLoadout {
   cwd: string | null;
   /** PI_CODING_AGENT_DIR the subagent resolved config/extensions from, or null. */
   agentDir: string | null;
+  /**
+   * Snapshot of the spawner session's /agent_model overrides (agent name ->
+   * qualified "provider/id") at spawn time, or null when there were none.
+   * Resume re-emits this as PI_SUBAGENT_MODEL_OVERRIDES so a resumed
+   * subagent's nested spawns keep the same semantics as at original spawn
+   * (the live parent map is deliberately NOT re-read — the snapshot is the
+   * point). Backward compatible: loadouts written before this field existed
+   * simply lack it; treat undefined as empty.
+   */
+  modelOverrides?: Record<string, string> | null;
 }
 
 /** Path of the loadout sidecar written next to a subagent session file. */

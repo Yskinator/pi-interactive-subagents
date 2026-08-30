@@ -1485,6 +1485,456 @@ describe("subagent discovery", () => {
     });
   });
 });
+describe("agent_model command (model overrides)", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  afterEach(() => {
+    testApi.resetAgentModelOverrides();
+    testApi.setInheritedModelOverrides(undefined);
+  });
+
+  describe("parseModelOverridesEnv", () => {
+    it("parses a valid JSON object into a map", () => {
+      const m = testApi.parseModelOverridesEnv(
+        '{"worker": "anthropic/claude-sonnet", "scout": "vllm/qwen"}',
+      );
+      assert.deepEqual(
+        m,
+        new Map([["worker", "anthropic/claude-sonnet"], ["scout", "vllm/qwen"]]),
+      );
+    });
+
+    it("returns undefined for unset or empty values", () => {
+      assert.equal(testApi.parseModelOverridesEnv(undefined), undefined);
+      assert.equal(testApi.parseModelOverridesEnv(""), undefined);
+    });
+
+    it("ignores malformed JSON", () => {
+      assert.equal(testApi.parseModelOverridesEnv("{not json"), undefined);
+      assert.equal(testApi.parseModelOverridesEnv("{}\n{"), undefined);
+    });
+
+    it("ignores non-object JSON", () => {
+      assert.equal(testApi.parseModelOverridesEnv("[]"), undefined);
+      assert.equal(testApi.parseModelOverridesEnv('"str"'), undefined);
+      assert.equal(testApi.parseModelOverridesEnv("42"), undefined);
+      assert.equal(testApi.parseModelOverridesEnv("null"), undefined);
+    });
+
+    it("filters non-string/empty values and drops objects with nothing left", () => {
+      assert.equal(
+        testApi.parseModelOverridesEnv(JSON.stringify({ a: 1, b: "", c: null })),
+        undefined,
+      );
+      assert.deepEqual(
+        testApi.parseModelOverridesEnv(JSON.stringify({ a: 1, b: "p/m" })),
+        new Map([["b", "p/m"]]),
+      );
+    });
+  });
+
+  describe("resolution precedence (per-session > inherited > agent default)", () => {
+    it("returns undefined with no overrides anywhere", () => {
+      assert.equal(testApi.getAgentModelOverride("sess-a", "worker"), undefined);
+      assert.equal(testApi.getAgentModelOverride(undefined, "worker"), undefined);
+      assert.equal(testApi.getAgentModelOverride("sess-a", undefined), undefined);
+      assert.equal(testApi.getAgentModelOverride(undefined, undefined), undefined);
+    });
+
+    it("falls back to the inherited snapshot when the session has no entry", () => {
+      testApi.setInheritedModelOverrides(new Map([["worker", "vllm/inherited-model"]]));
+      assert.equal(testApi.getAgentModelOverride("sess-b", "worker"), "vllm/inherited-model");
+      // An undefined session id still sees the inherited snapshot.
+      assert.equal(testApi.getAgentModelOverride(undefined, "worker"), "vllm/inherited-model");
+      // Agents not in the snapshot are unaffected.
+      assert.equal(testApi.getAgentModelOverride("sess-b", "scout"), undefined);
+    });
+
+    it("per-session entry wins over the inherited snapshot", () => {
+      testApi.setInheritedModelOverrides(new Map([["worker", "vllm/inherited-model"]]));
+      testApi.setAgentModelOverride("sess-c", "worker", "anthropic/claude-sonnet");
+      assert.equal(testApi.getAgentModelOverride("sess-c", "worker"), "anthropic/claude-sonnet");
+      // Other sessions are unaffected and still see the inherited snapshot.
+      assert.equal(testApi.getAgentModelOverride("sess-d", "worker"), "vllm/inherited-model");
+    });
+
+    it("per-session entries are isolated by session id", () => {
+      testApi.setAgentModelOverride("sess-e", "worker", "a/b");
+      testApi.setAgentModelOverride("sess-f", "worker", "c/d");
+      assert.equal(testApi.getAgentModelOverride("sess-e", "worker"), "a/b");
+      assert.equal(testApi.getAgentModelOverride("sess-f", "worker"), "c/d");
+      assert.equal(testApi.getAgentModelOverride("sess-g", "worker"), undefined);
+    });
+  });
+
+  describe("setAgentModelOverride", () => {
+    it("stores a qualified ref for the session only", () => {
+      testApi.setAgentModelOverride("sess-h", "worker", "anthropic/claude-sonnet");
+      assert.equal(testApi.getAgentModelOverride("sess-h", "worker"), "anthropic/claude-sonnet");
+      assert.equal(testApi.getAgentModelOverride("sess-h2", "worker"), undefined);
+    });
+
+    it("'default' deletes the entry, falling back to inherited then agent default", () => {
+      const s = "sess-i";
+      testApi.setInheritedModelOverrides(new Map([["worker", "vllm/inherited-model"]]));
+      testApi.setAgentModelOverride(s, "worker", "anthropic/claude-sonnet");
+      testApi.setAgentModelOverride(s, "worker", "default");
+      assert.equal(testApi.getAgentModelOverride(s, "worker"), "vllm/inherited-model");
+      // With no inherited snapshot either, resolution falls through to undefined
+      // (the caller then uses the agent file default).
+      testApi.setInheritedModelOverrides(undefined);
+      assert.equal(testApi.getAgentModelOverride(s, "worker"), undefined);
+    });
+
+    it("'default' with no existing entry is a no-op", () => {
+      testApi.setAgentModelOverride("sess-j", "worker", "default");
+      assert.equal(testApi.getAgentModelOverride("sess-j", "worker"), undefined);
+      assert.deepEqual(testApi.getMergedModelOverrides("sess-j"), {});
+    });
+  });
+
+  describe("getMergedModelOverrides (spawn/resume env emission)", () => {
+    it("returns {} when there are no overrides", () => {
+      assert.deepEqual(testApi.getMergedModelOverrides("sess-k"), {});
+    });
+
+    it("includes only the inherited snapshot when the session has no entries", () => {
+      testApi.setInheritedModelOverrides(new Map([["worker", "vllm/x"]]));
+      assert.deepEqual(testApi.getMergedModelOverrides("sess-l"), { worker: "vllm/x" });
+    });
+
+    it("merges inherited + per-session with per-session winning", () => {
+      testApi.setInheritedModelOverrides(
+        new Map([
+          ["worker", "vllm/inherited-worker"],
+          ["scout", "vllm/inherited-scout"],
+        ]),
+      );
+      const s = "sess-m";
+      testApi.setAgentModelOverride(s, "worker", "anthropic/claude-sonnet");
+      assert.deepEqual(testApi.getMergedModelOverrides(s), {
+        worker: "anthropic/claude-sonnet",
+        scout: "vllm/inherited-scout",
+      });
+      // The JSON round-trip used for env emission is stable.
+      const emitted = JSON.stringify(testApi.getMergedModelOverrides(s));
+      const parsed = testApi.parseModelOverridesEnv(emitted);
+      assert.ok(parsed);
+      assert.deepEqual(Object.fromEntries(parsed), testApi.getMergedModelOverrides(s));
+    });
+  });
+
+  describe("command registration and handler", () => {
+    const fakeTheme: any = { fg: (_c: string, t: string) => t, bold: (t: string) => t };
+    const tick = () => new Promise((r) => setTimeout(r, 0));
+
+    function makeCtx(overrides: {
+      hasUI?: boolean;
+      models?: Array<{ provider: string; id: string }>;
+      sessionId?: string;
+    }) {
+      const notifications: Array<[string, string?]> = [];
+      const comps: any[] = [];
+      return {
+        ctx: {
+          hasUI: overrides.hasUI ?? false,
+          ui: {
+            notify: (msg: string, type?: string) => notifications.push([msg, type]),
+            custom: (factory: any) =>
+              new Promise((resolve) => {
+                const comp = factory(null, fakeTheme, null, (v: string | undefined) => resolve(v));
+                comps.push(comp);
+              }),
+          },
+          modelRegistry: {
+            getAvailable: () =>
+              overrides.models ?? [
+                { provider: "vllm", id: "qwen" },
+                { provider: "anthropic", id: "claude-sonnet" },
+              ],
+          },
+          sessionManager: { getSessionId: () => overrides.sessionId ?? "am-sess" },
+        },
+        notifications,
+        comps,
+      };
+    }
+
+    /**
+     * Register the extension in an isolated agent env and hand the test the
+     * command plus a visible agent name. The visible set depends on
+     * PI_SUBAGENT_ALLOWED (seeded at module load from the ambient env), so
+     * pick whatever is visible here and shadow it with a project file that
+     * pins the default model — deterministic in every environment.
+     */
+    async function withAgentModelCommand(
+      fn: (cmd: any, agentName: string) => Promise<void> | void,
+    ) {
+      await withIsolatedAgentEnv(async ({ projectAgentsDir }) => {
+        const { api, registeredCommands } = createMockExtensionApi();
+        (subagentsModule as any).default(api);
+        const cmd = registeredCommands.find((c: any) => c.name === "agent_model");
+        assert.ok(cmd, "expected agent_model to be registered");
+        const visible = (cmd.getArgumentCompletions("") ?? []).map((i: any) => i.value);
+        if (visible.length === 0) return; // no discoverable agents in this env
+        const agentName = visible[0];
+        writeAgentFile(
+          projectAgentsDir,
+          agentName,
+          `name: ${agentName}\nmodel: vllm/agent-default`,
+        );
+        await fn(cmd, agentName);
+      });
+    }
+
+    it("registers agent_model next to subagent with completions", () => {
+      const { api, registeredCommands } = createMockExtensionApi();
+      (subagentsModule as any).default(api);
+      const names = registeredCommands.map((c: any) => c.name);
+      assert.ok(names.includes("subagent"), "subagent command should be registered");
+      const cmd = registeredCommands.find((c: any) => c.name === "agent_model");
+      assert.ok(cmd, "agent_model command should be registered");
+      assert.match(cmd.description, /model/);
+      assert.equal(typeof cmd.getArgumentCompletions, "function");
+      assert.equal(typeof cmd.handler, "function");
+    });
+
+    it("completes the first argument with discovered agent names", async () => {
+      await withAgentModelCommand((cmd, agentName) => {
+        const items = cmd.getArgumentCompletions(agentName.slice(0, 3));
+        assert.ok(
+          items?.some((i: any) => i.value === agentName),
+          "agent name should be offered for its prefix",
+        );
+        // No match -> null (fall back to other providers)
+        assert.equal(cmd.getArgumentCompletions("zzz-no-such"), null);
+      });
+    });
+
+    it("applies the full form /agent_model <agent> <model> in non-TUI mode", async () => {
+      await withAgentModelCommand(async (cmd, agentName) => {
+        const { ctx, notifications } = makeCtx({ hasUI: false, sessionId: "am-sess-1" });
+
+        // Bare model id resolves to its provider.
+        await cmd.handler(`${agentName} qwen`, ctx);
+        assert.equal(testApi.getAgentModelOverride("am-sess-1", agentName), "vllm/qwen");
+
+        // Unknown model -> error notification, override unchanged.
+        await cmd.handler(`${agentName} no/such-model`, ctx);
+        assert.equal(testApi.getAgentModelOverride("am-sess-1", agentName), "vllm/qwen");
+        const err = notifications[notifications.length - 1];
+        assert.deepEqual(err, [`Unknown model "no/such-model".`, "error"]);
+
+        // Qualified ref passes through.
+        await cmd.handler(`${agentName} anthropic/claude-sonnet`, ctx);
+        assert.equal(
+          testApi.getAgentModelOverride("am-sess-1", agentName),
+          "anthropic/claude-sonnet",
+        );
+
+        // "default" clears the override (agent default is then used).
+        await cmd.handler(`${agentName} default`, ctx);
+        assert.equal(testApi.getAgentModelOverride("am-sess-1", agentName), undefined);
+        assert.match(
+          notifications[notifications.length - 1][0],
+          /default model \(vllm\/agent-default\)/,
+        );
+      });
+    });
+
+    it("rejects unknown agents and requires TUI mode for the pickers", async () => {
+      await withAgentModelCommand(async (cmd, agentName) => {
+        const { ctx, notifications } = makeCtx({ hasUI: false, sessionId: "am-sess-2" });
+
+        await cmd.handler("zzz-no-such-agent", ctx);
+        const err = notifications[notifications.length - 1];
+        assert.equal(err[1], "error");
+        assert.match(err[0], /Unknown agent "zzz-no-such-agent"/);
+        assert.match(err[0], new RegExp(agentName));
+
+        // Agent given but no model -> TUI usage warning.
+        await cmd.handler(agentName, ctx);
+        const warn1 = notifications[notifications.length - 1];
+        assert.equal(warn1[1], "warning");
+        assert.match(warn1[0], /requires TUI mode/);
+
+        // No args at all -> TUI usage warning.
+        await cmd.handler("", ctx);
+        const warn2 = notifications[notifications.length - 1];
+        assert.equal(warn2[1], "warning");
+        assert.match(warn2[0], /requires TUI mode/);
+      });
+    });
+
+    it("runs the two-stage picker flow in TUI mode (agent picker -> model picker)", async () => {
+      await withAgentModelCommand(async (cmd, agentName) => {
+        const { ctx, comps, notifications } = makeCtx({ hasUI: true, sessionId: "am-sess-3" });
+
+        const p = cmd.handler("", ctx);
+        await tick();
+        const stage1 = comps[0];
+        assert.ok(stage1, "stage-1 agent picker should be open");
+        const agentIndex = stage1.items.findIndex((it: any) => it.label === agentName);
+        assert.ok(agentIndex >= 0, "agent should appear in the picker");
+        for (let i = 0; i < agentIndex; i++) stage1.handleInput("\x1b[B"); // down
+        stage1.handleInput("\r"); // enter
+
+        await tick();
+        const stage2 = comps[1];
+        assert.ok(stage2, "stage-2 model picker should be open");
+        // Items: [default, ...sorted models] — sorted by "provider/id".
+        assert.deepEqual(
+          stage2.items.map((it: any) => it.value),
+          ["default", "anthropic/claude-sonnet", "vllm/qwen"],
+        );
+        // No existing override: "default" is preselected (index 0).
+        stage2.handleInput("\x1b[B"); // down -> claude-sonnet
+        stage2.handleInput("\r"); // enter
+
+        await p;
+        assert.equal(
+          testApi.getAgentModelOverride("am-sess-3", agentName),
+          "anthropic/claude-sonnet",
+        );
+        assert.match(
+          notifications[notifications.length - 1][0],
+          /anthropic\/claude-sonnet/,
+        );
+      });
+    });
+
+    it("preselects the current effective model and honours esc cancel", async () => {
+      await withAgentModelCommand(async (cmd, agentName) => {
+        // Existing session override -> preselected in the model picker.
+        testApi.setAgentModelOverride("am-sess-4", agentName, "vllm/qwen");
+        const { ctx, comps, notifications } = makeCtx({ hasUI: true, sessionId: "am-sess-4" });
+
+        const p = cmd.handler(agentName, ctx); // agent given -> straight to stage 2
+        await tick();
+        const stage2 = comps[0];
+        assert.ok(stage2, "model picker should be open directly");
+        const lines = stage2.render(100);
+        const selectedLine = lines.find((l: string) => l.startsWith("> "));
+        assert.ok(selectedLine, "a row should be preselected");
+        assert.match(selectedLine, /qwen/);
+
+        stage2.handleInput("\x1b"); // esc cancels
+        await p;
+        // Override untouched, no notifications.
+        assert.equal(testApi.getAgentModelOverride("am-sess-4", agentName), "vllm/qwen");
+        assert.equal(notifications.length, 0);
+      });
+    });
+
+    it("picking 'default' in the model picker clears the override", async () => {
+      await withAgentModelCommand(async (cmd, agentName) => {
+        testApi.setAgentModelOverride("am-sess-5", agentName, "vllm/qwen");
+        const { ctx, comps, notifications } = makeCtx({ hasUI: true, sessionId: "am-sess-5" });
+
+        // Items: [default, claude-sonnet, qwen]; the override preselects
+        // qwen (index 2). Down wraps to "default" (index 0); enter confirms.
+        const p = cmd.handler(agentName, ctx);
+        await tick();
+        const stage2 = comps[0];
+        assert.ok(stage2);
+        stage2.handleInput("\x1b[B"); // down (wraps to "default")
+        stage2.handleInput("\r"); // enter
+
+        await p;
+        assert.equal(testApi.getAgentModelOverride("am-sess-5", agentName), undefined);
+        assert.match(
+          notifications[notifications.length - 1][0],
+          /default model \(vllm\/agent-default\)/,
+        );
+      });
+    });
+
+    it("labels stage-1 agent hints by override source (session vs inherited)", async () => {
+      await withAgentModelCommand(async (cmd, agentName) => {
+        const s = "am-sess-6";
+        const { ctx, comps } = makeCtx({ hasUI: true, sessionId: s });
+
+        // No override anywhere: agent file default hint.
+        let p = cmd.handler("", ctx);
+        await tick();
+        let stage1 = comps[0];
+        assert.ok(stage1);
+        let item = stage1.items.find((it: any) => it.label === agentName);
+        assert.ok(item);
+        assert.equal(item.hint, "model: vllm/agent-default (default)");
+        stage1.handleInput("\x1b"); // esc cancels
+        await p;
+
+        // Inherited spawner snapshot only: labelled as inherited.
+        testApi.setInheritedModelOverrides(
+          new Map([[agentName, "vllm/inherited-model"]]),
+        );
+        p = cmd.handler("", ctx);
+        await tick();
+        stage1 = comps[1];
+        assert.ok(stage1);
+        item = stage1.items.find((it: any) => it.label === agentName);
+        assert.ok(item);
+        assert.equal(
+          item.hint,
+          "model: vllm/inherited-model (inherited from spawner)",
+        );
+        stage1.handleInput("\x1b");
+        await p;
+
+        // Per-session entry: labelled as a session override.
+        testApi.setAgentModelOverride(s, agentName, "anthropic/claude-sonnet");
+        p = cmd.handler("", ctx);
+        await tick();
+        stage1 = comps[2];
+        assert.ok(stage1);
+        item = stage1.items.find((it: any) => it.label === agentName);
+        assert.ok(item);
+        assert.equal(
+          item.hint,
+          "model: anthropic/claude-sonnet (session override)",
+        );
+        stage1.handleInput("\x1b");
+        await p;
+      });
+    });
+
+    it("keeps the selection visible when the model list overflows the window", async () => {
+      await withAgentModelCommand(async (cmd, agentName) => {
+        const models = Array.from({ length: 20 }, (_, i) => ({
+          provider: "vllm",
+          id: `model-${String(i).padStart(2, "0")}`,
+        }));
+        const { ctx, comps } = makeCtx({ hasUI: true, sessionId: "am-sess-7", models });
+
+        const p = cmd.handler(agentName, ctx);
+        await tick();
+        const stage2 = comps[0];
+        assert.ok(stage2);
+        assert.equal(stage2.items.length, 21); // default + 20 sorted models
+
+        // Selection starts at "default" (index 0); walk to the last item.
+        for (let i = 0; i < 20; i++) stage2.handleInput("\x1b[B"); // down
+
+        const lines = stage2.render(100);
+        const selectedLine = lines.find((l: string) => l.startsWith("> "));
+        assert.ok(
+          selectedLine,
+          "the selected row must stay visible while scrolling",
+        );
+        assert.match(selectedLine, /model-19/);
+        assert.ok(!lines.includes("  default"), "'default' should have scrolled out");
+
+        stage2.handleInput("\r"); // enter
+        await p;
+        assert.equal(
+          testApi.getAgentModelOverride("am-sess-7", agentName),
+          "vllm/model-19",
+        );
+      });
+    });
+  });
+});
 describe("subagent-done.ts", () => {
   describe("shouldMarkUserTookOver", () => {
     it("ignores the initial injected task before the first agent run", () => {

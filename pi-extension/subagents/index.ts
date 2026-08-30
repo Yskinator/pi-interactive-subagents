@@ -43,6 +43,7 @@ import {
   type SessionStats,
   type SubagentLoadout,
 } from "./session.ts";
+import { registerAgentModelCommand } from "./agent-model-command.ts";
 import {
   type StatusSnapshot,
   type SubagentStatusState,
@@ -287,6 +288,116 @@ const SUBAGENT_ALLOWLIST: Set<string> | null = (() => {
   const list = raw.split(",").map((s) => s.trim()).filter(Boolean);
   return list.length > 0 ? new Set(list) : null;
 })();
+
+/**
+ * /agent_model overrides per spawner session: sessionId -> agent name ->
+ * qualified model ref ("provider/id"). In-memory only — like pi's /model,
+ * overrides apply to subagents spawned after they were set and reset on
+ * restart.
+ */
+const modelOverridesBySession = new Map<string, Map<string, string>>();
+
+function getAgentModelOverrideMap(sessionId: string | undefined): Map<string, string> {
+  if (!sessionId) return new Map();
+  let m = modelOverridesBySession.get(sessionId);
+  if (!m) {
+    m = new Map();
+    modelOverridesBySession.set(sessionId, m);
+  }
+  return m;
+}
+
+/**
+ * Parse the PI_SUBAGENT_MODEL_OVERRIDES env var (a JSON object of agent name
+ * -> qualified model ref) into a map, or undefined when unset/empty. Malformed
+ * JSON is ignored: inherited overrides are a convenience for nested spawns,
+ * never a launch blocker.
+ */
+export function parseModelOverridesEnv(
+  raw: string | undefined,
+): Map<string, string> | undefined {
+  if (!raw) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    return undefined;
+  }
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) return undefined;
+  const out = new Map<string, string>();
+  for (const [k, v] of Object.entries(parsed as Record<string, unknown>)) {
+    if (typeof v === "string" && v.length > 0) out.set(k, v);
+  }
+  return out.size > 0 ? out : undefined;
+}
+
+// Overrides inherited from the spawner, seeded at module load (mirroring the
+// SUBAGENT_ALLOWLIST seeding above). Subagent processes inherit the spawner's
+// overrides as a snapshot taken at spawn time: a subagent spawned before an
+// override was set keeps the older snapshot (inherent to in-memory state),
+// and a subagent spawned after sees the new one.
+let inheritedModelOverrides: Map<string, string> | undefined = parseModelOverridesEnv(
+  process.env.PI_SUBAGENT_MODEL_OVERRIDES,
+);
+
+/** Test hook: replace the module-load inherited override snapshot. */
+function setInheritedModelOverrides(m: Map<string, string> | undefined): void {
+  inheritedModelOverrides = m;
+}
+
+/** Test hook: drop all per-session overrides. */
+function resetAgentModelOverrides(): void {
+  modelOverridesBySession.clear();
+}
+
+/**
+ * Resolve the /agent_model override for an agent: the calling session's own
+ * override wins, then the spawner-inherited snapshot (nested spawn), then
+ * undefined (caller falls back to the agent file default).
+ */
+export function getAgentModelOverride(
+  sessionId: string | undefined,
+  agentName: string | undefined,
+): string | undefined {
+  if (!agentName) return undefined;
+  return (
+    getAgentModelOverrideMap(sessionId).get(agentName) ??
+    inheritedModelOverrides?.get(agentName)
+  );
+}
+
+/**
+ * Set (or clear with "default") this session's override for an agent. `modelRef`
+ * must be a qualified "provider/id" string — the caller validates against
+ * ctx.modelRegistry before calling. "default" removes the per-session entry so
+ * resolution falls back to the inherited snapshot, then the agent default.
+ */
+export function setAgentModelOverride(
+  sessionId: string | undefined,
+  agentName: string,
+  modelRef: string,
+): void {
+  const m = getAgentModelOverrideMap(sessionId);
+  if (modelRef === "default" || modelRef === "reset") {
+    m.delete(agentName);
+  } else {
+    m.set(agentName, modelRef);
+  }
+}
+
+/**
+ * Merged override map for the session (inherited snapshot + per-session
+ * entries, per-session winning) — what spawn/resume emit as
+ * PI_SUBAGENT_MODEL_OVERRIDES so nested spawns resolve the same models.
+ */
+export function getMergedModelOverrides(sessionId: string | undefined): Record<string, string> {
+  const merged: Record<string, string> = {};
+  if (inheritedModelOverrides) {
+    for (const [k, v] of inheritedModelOverrides) merged[k] = v;
+  }
+  for (const [k, v] of getAgentModelOverrideMap(sessionId)) merged[k] = v;
+  return merged;
+}
 
 function getBundledAgentsDir(): string {
   return join(SUBAGENTS_DIR, "../../agents");
@@ -1831,6 +1942,14 @@ export const __test__ = {
       (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
   },
+  // /agent_model internals (unit-test hooks)
+  parseModelOverridesEnv,
+  getAgentModelOverride,
+  setAgentModelOverride,
+  getMergedModelOverrides,
+  modelOverridesBySession,
+  setInheritedModelOverrides,
+  resetAgentModelOverrides,
 };
 
 function startWidgetRefresh() {
@@ -1857,7 +1976,15 @@ async function launchSubagent(
   const id = Math.random().toString(16).slice(2, 10);
 
   const agentDefs = params.agent ? loadAgentDefaults(params.agent) : null;
-  const effectiveModel = params.model ?? agentDefs?.model;
+  const sessionId = ctx.sessionManager.getSessionId();
+  // Model resolution: explicit tool param > this session's /agent_model
+  // override (its own per-session entries, then the snapshot inherited from
+  // the spawner — this is what propagates overrides into nested spawns) >
+  // the agent file default.
+  const effectiveModel =
+    params.model ??
+    (params.agent ? getAgentModelOverride(sessionId, params.agent) : undefined) ??
+    agentDefs?.model;
   const effectiveTools = agentDefs?.tools;
   const effectiveSkills = agentDefs?.skills;
   const effectiveThinking = agentDefs?.thinking;
@@ -1865,7 +1992,6 @@ async function launchSubagent(
 
   const sessionFile = ctx.sessionManager.getSessionFile();
   if (!sessionFile) throw new Error("No session file");
-  const sessionId = ctx.sessionManager.getSessionId();
   const artifactDir = getArtifactDir(ctx.sessionManager.getSessionDir(), sessionId);
 
   const { effectiveCwd, localAgentDir, effectiveAgentDir } = resolveSubagentPaths(params, agentDefs);
@@ -2018,6 +2144,11 @@ async function launchSubagent(
   // restriction keep their full default toolset and all global extensions.
   const toolAllowlist = buildSubagentToolAllowlist(effectiveTools, { grantSpawning });
 
+  // Snapshot the session's model overrides (inherited + per-session) so a
+  // later resume can re-emit the same PI_SUBAGENT_MODEL_OVERRIDES for this
+  // subagent's own nested spawns.
+  const modelOverrides = getMergedModelOverrides(sessionId);
+
   // Snapshot the fully-resolved sandbox beside the session file so a later
   // `subagent_message({ name })` resume can replay the exact same
   // restriction instead of relaunching pi with all global extensions + tools.
@@ -2032,6 +2163,7 @@ async function launchSubagent(
     autoExit: agentDefs?.autoExit ?? false,
     cwd: effectiveCwd ?? null,
     agentDir: resolvedAgentDir,
+    modelOverrides: Object.keys(modelOverrides).length > 0 ? modelOverrides : null,
   };
   writeSubagentLoadout(subagentSessionFile, loadout);
 
@@ -2048,6 +2180,9 @@ async function launchSubagent(
 
   if (grantSpawning && agentDefs?.subagentAgents) {
     envParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(agentDefs.subagentAgents.join(","))}`);
+  }
+  if (Object.keys(modelOverrides).length > 0) {
+    envParts.push(`PI_SUBAGENT_MODEL_OVERRIDES=${shellEscape(JSON.stringify(modelOverrides))}`);
   }
   envParts.push(`PI_SUBAGENT_NAME=${shellEscape(params.name)}`);
   if (params.agent) {
@@ -3059,6 +3194,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (loadout.spawnable && loadout.spawnable.length > 0) {
           resumeEnvParts.push(`PI_SUBAGENT_ALLOWED=${shellEscape(loadout.spawnable.join(","))}`);
         }
+        // Replay the snapshot's model overrides (NOT the live parent map — the
+        // loadout is the spawn-time source of truth) so the resumed process
+        // keeps the same nested-spawn model semantics it originally ran with.
+        if (loadout.modelOverrides && Object.keys(loadout.modelOverrides).length > 0) {
+          resumeEnvParts.push(
+            `PI_SUBAGENT_MODEL_OVERRIDES=${shellEscape(JSON.stringify(loadout.modelOverrides))}`,
+          );
+        }
         if (loadout.agent) {
           resumeEnvParts.push(`PI_SUBAGENT_AGENT=${shellEscape(loadout.agent)}`);
         }
@@ -3209,6 +3352,25 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const displayName = agentName[0].toUpperCase() + agentName.slice(1);
       const toolCall = `Use subagent with agent: "${agentName}", name: "${displayName}", task: ${JSON.stringify(taskText)}`;
       pi.sendUserMessage(toolCall);
+    },
+  });
+
+  // /agent_model command — change the model a named sub-agent uses for the
+  // rest of this session (in-memory, like pi's /model). Overrides propagate
+  // to nested spawns via PI_SUBAGENT_MODEL_OVERRIDES at spawn time.
+  registerAgentModelCommand(pi, {
+    listAgents: () =>
+      discoverAgentDefinitions().map((a) => ({ name: a.name, model: a.model })),
+    getOverride: getAgentModelOverride,
+    getSessionOverride: (sessionId, agentName) =>
+      agentName ? getAgentModelOverrideMap(sessionId).get(agentName) : undefined,
+    setOverride: setAgentModelOverride,
+    listModelRefs: () => {
+      // Argument completion has no ctx; use the last captured session context.
+      const models = latestCtx?.modelRegistry.getAvailable();
+      return models && models.length > 0
+        ? models.map((m) => `${m.provider}/${m.id}`)
+        : undefined;
     },
   });
 
