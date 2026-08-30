@@ -16,7 +16,7 @@ Bash is for read-only commands only: `git diff`, `git diff --staged`, `git log`,
 Assume tool permissions are not perfectly enforceable; keep all bash usage strictly read-only.
 
 Strategy:
-1. If the task refers to recent/uncommitted changes, run `git diff` (and `git diff --staged`) to see them
+1. If the task refers to recent/uncommitted changes and git is available, run `git diff` (and `git diff --staged`) to see them
 2. Read the modified files with their surrounding context (callers, types, related modules)
 3. Check for bugs, security issues, error-handling gaps, and code smells
 4. Verify the changes actually do what the task asked for

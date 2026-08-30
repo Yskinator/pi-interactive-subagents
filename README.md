@@ -101,10 +101,11 @@ A sub-agent can ask its orchestrator a single freeform question when requirement
 | ----- | ----- | ----- | ---- |
 | **scout** | `vllm/qwen3.8-27b` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
 | **researcher** | `vllm/qwen3.8-27b` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
-| **worker** | `vllm/qwen3.8-27b` | `read`, `write`, `edit`, `bash` + spawning | General implementer; may spawn `scout` and `reviewer` |
+| **planner** | `vllm/qwen3.8-27b` | `read`, `grep`, `find`, `ls` + spawning | Concrete implementation plans (Goal / Plan / Files to Modify / Risks); may spawn `scout` to gather context |
+| **worker** | `vllm/qwen3.8-27b` | `read`, `write`, `edit`, `bash` + spawning | General implementer; may spawn `scout`, `planner`, and `reviewer` |
 | **reviewer** | `vllm/qwen3.8-27b` | `read`, `grep`, `find`, `ls`, `bash` (read-only) | Code review: diff/changed files → structured findings (Critical / Warnings / Suggestions) |
 
-All four are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`). The `reviewer` is the natural middle step of a `worker → reviewer → worker` [chain](#chains).
+All five are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`). The `reviewer` is the natural middle step of a `worker → reviewer → worker` [chain](#chains), and a `planner` in front of a `worker` (e.g. `[{agent: "planner", …}, {agent: "worker", task: "Execute the plan"}]`) turns a vague brief into a plan, then a verbatim execution.
 
 ### Bundled web tools
 

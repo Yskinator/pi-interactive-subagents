@@ -1175,8 +1175,8 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled scout/researcher/worker/reviewer all resolve as non-interactive (auto-exit)", () => {
-    for (const name of ["scout", "researcher", "worker", "reviewer"]) {
+  it("bundled scout/researcher/planner/worker/reviewer all resolve as non-interactive (auto-exit)", () => {
+    for (const name of ["scout", "researcher", "planner", "worker", "reviewer"]) {
       const defs = testApi.loadAgentDefaults(name);
       assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
       assert.equal(
@@ -1196,10 +1196,10 @@ describe("subagent discovery", () => {
     }
   });
 
-  it("worker is granted the spawning toolset restricted to scout and reviewer", () => {
+  it("worker is granted the spawning toolset restricted to scout, planner, and reviewer", () => {
     const worker = testApi.loadAgentDefaults("worker");
     assert.ok(worker, "expected bundled worker to be discoverable");
-    assert.deepEqual(worker.subagentAgents, ["scout", "reviewer"]);
+    assert.deepEqual(worker.subagentAgents, ["scout", "planner", "reviewer"]);
 
     const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true });
     assert.ok(allowlist, "expected an allowlist");
@@ -1211,6 +1211,26 @@ describe("subagent discovery", () => {
     // Policy: workers are pure implementers — no web tools of their own.
     assert.ok(!tools.has("web_search"), "worker must not get web_search");
     assert.ok(!tools.has("web_fetch"), "worker must not get web_fetch");
+  });
+
+  it("planner is granted the spawning toolset restricted to scout", () => {
+    const planner = testApi.loadAgentDefaults("planner");
+    assert.ok(planner, "expected bundled planner to be discoverable");
+    assert.deepEqual(planner.subagentAgents, ["scout"]);
+
+    const allowlist = testApi.buildSubagentToolAllowlist(planner.tools, { grantSpawning: true });
+    assert.ok(allowlist, "expected an allowlist");
+    const tools = new Set(allowlist!.split(","));
+    for (const t of ["subagent", "subagent_message", "subagents_list"]) {
+      assert.ok(tools.has(t), `expected spawning tool ${t} in planner allowlist`);
+    }
+    // Policy: planner is read-only — it plans, never edits.
+    for (const t of ["read", "grep", "find", "ls"]) {
+      assert.ok(tools.has(t), `expected planner tool ${t}`);
+    }
+    for (const t of ["write", "edit", "bash"]) {
+      assert.ok(!tools.has(t), `planner must not have ${t}`);
+    }
   });
 
   it("scout, researcher, and reviewer are not granted spawning tools", () => {
