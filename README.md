@@ -93,9 +93,7 @@ Every spawn records name → session file in `artifacts/<sessionId>/subagent-reg
 
 ### ask_question
 
-A sub-agent can ask its orchestrator a single freeform question when requirements are ambiguous or a decision materially affects the work. The session **stays open** (parked as `waiting`) instead of exiting; the parent is notified with the sub-agent's name, replies via `subagent_message({ name, message })`, and the reply arrives as the sub-agent's next turn. Parallel questions are supported — each waiting sub-agent has its own name.
-
-If the reply arrives while the sub-agent is still mid-turn, it is absorbed into the current turn — either way the question is marked answered and the session exits normally when the work is done. If the parent never replies, the pane stays open until a human closes it. Only available inside sub-agent sessions.
+A sub-agent can ask its orchestrator a single freeform question when requirements are ambiguous or a decision materially affects the work. The tool call **blocks** until the orchestrator replies (up to 10 minutes): the sub-agent writes a `${sessionFile}.ask` signal, the parent is notified with the sub-agent's name, and the orchestrator replies via `subagent_message({ name, message })` — the parent writes the reply to `${sessionFile}.ask-reply` (as JSON `{ askedAt, text }`, echoed from the `.ask` file so a reply from a different question cycle is rejected), and the sub-agent's call returns it as the **tool result**. The question is answered within the same turn: the session shows as active while waiting, and the sub-agent continues immediately with the answer. If the parent never replies within 10 minutes, the tool returns a no-reply note and the sub-agent decides whether to proceed with its best judgment or stop and summarize. A reply sent *after* the call has already timed out (or the wait was interrupted) is not consumed by the call — it is typed into the sub-agent's pane as a normal steer, picked up on its next turn. Parallel questions are supported — each sub-agent has its own name. Only available inside sub-agent sessions.
 
 ## Bundled agents
 
@@ -167,7 +165,7 @@ With `auto-exit: true`, the session shuts down when the agent's turn ends — th
 Notes:
 
 - **Manual input does not strand an auto-exit sub-agent.** If a human types into the pane, the session still closes once that turn completes normally — only an escape/abort leaves it open.
-- **Auto-exit is suppressed while work is in flight:** the session parks as `waiting` instead of exiting when an `ask_question` is still unanswered, or when the agent's own child sub-agents are still running (a worker can stop after dispatching children and stays open until the last result returns).
+- **Auto-exit is suppressed while work is in flight:** an in-flight `ask_question` call blocks the turn until the orchestrator replies (or the 10-minute timeout elapses), so the session stays open and shows as active for the duration of the wait — once the reply is consumed (or the timeout handled), the flag is cleared inside the tool and auto-exit resumes for the rest of the turn. The same suppression applies while the agent's own child sub-agents are still running (a worker can stop after dispatching children and stays open until the last result returns).
 
 ### interactive
 
@@ -221,7 +219,7 @@ tmux new -A -s pi 'pi'
 
 ## Acknowledgements
 
-Forker from [amosblomqvist/pi-interactive-subagents](https://github.com/amosblomqvist/pi-interactive-subagents). I've since added sub-agent chains, a reviewer agents, and bundled web search tools. I yoinked the last two from here [amosblomqviest/pi-config](https://github.com/amosblomqvist/pi-config/) and tweaked them to suit my needs. I also made the sub-agents use my local vllm server instead of cloud models.
+Forker from [amosblomqvist/pi-interactive-subagents](https://github.com/amosblomqvist/pi-interactive-subagents). I've since added sub-agent chains, a reviewer agents, and bundled web search tools. I yoinked the last two from here [amosblomqviest/pi-config](https://github.com/amosblomqvist/pi-config/) and tweaked them to suit my needs. I also made the sub-agents use my local vllm server instead of cloud models and made the sub-agent ask questions tool blocking instead of async.
 amosblomqviest/pi-interactive-subagents was forked from from [HazAT/pi-interactive-subagents](https://github.com/HazAT/pi-interactive-subagents), which originated the subagent architecture, the multi-multiplexer surface layer, and the status widget; its supervision features were inspired by [RepoPrompt](https://repoprompt.com/).
 
 ## License

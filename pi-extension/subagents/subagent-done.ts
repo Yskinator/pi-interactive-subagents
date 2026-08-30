@@ -7,16 +7,35 @@
  * automatically when their agent loop ends (see the `agent_end` handler);
  * interactive agents end when the human exits the pane.
  *
- * `ask_question` keeps the session OPEN: it writes a `${sessionFile}.ask`
- * signal the parent's watcher picks up, parks the session in a "waiting" state
- * (auto-exit is suppressed for that turn via `awaitingAnswer`), and the parent
- * replies with subagent_message — which lands as the subagent's next turn.
+ * `ask_question` BLOCKS until the orchestrator replies: it writes a
+ * `${sessionFile}.ask` signal the parent's watcher picks up, then polls
+ * `${sessionFile}.ask-reply` (written by the parent's subagent_message as
+ * JSON `{ askedAt, text }`, echoed from the `.ask` file so a reply from a
+ * different question cycle is rejected) and returns the orchestrator's
+ * reply as the tool result — the question is answered within the same
+ * turn. While the call is waiting, `awaitingAnswer` suppresses auto-exit
+ * so the session stays open (shown as active). On abort/timeout/consumption
+ * the call unlinks the sidecars itself, so a lingering `.ask` only ever
+ * comes from a child that was killed mid-wait — the parent's watcher
+ * unlinks the sidecars when the pane dies and again on resume.
  */
 import type { ExtensionAPI } from "@mariozechner/pi-coding-agent";
 import { Box, Text } from "@mariozechner/pi-tui";
 import { Type } from "@sinclair/typebox";
-import { writeFileSync } from "node:fs";
+import { readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { createSubagentActivityRecorder } from "./activity.ts";
+
+/**
+ * Test hooks for the blocking `ask_question` wait loop. `pollMs` is how often
+ * the reply file is checked; `timeoutMs` caps how long the call blocks. Tests
+ * override both to stay fast; production defaults are 500 ms / 10 minutes.
+ */
+export const __test__ = {
+  askQuestion: {
+    pollMs: 500,
+    timeoutMs: 10 * 60 * 1000,
+  },
+};
 
 export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
   return agentStarted;
@@ -178,10 +197,13 @@ export default function (pi: ExtensionAPI) {
 
   let userTookOver = false;
   let agentStarted = false;
-  // Set when ask_question is called; suppresses auto-exit so the session stays
-  // open while it waits for the orchestrator's reply. Cleared when the reply
-  // lands — on `input` (covers a reply steered into the current run) and on
-  // `agent_start` (covers a reply that starts a fresh turn after parking).
+  // Set while ask_question is blocked waiting for the orchestrator's reply;
+  // suppresses auto-exit so the session stays open for the duration of the
+  // wait. Cleared INSIDE the tool once the reply (or the timeout) is handled —
+  // the answer is consumed within the same turn, so without that clear
+  // `agent_end` would wrongly park the session as `waiting`. The `input` /
+  // `agent_start` clears below remain as a defensive backstop for input that
+  // arrives as a fresh turn.
   let awaitingAnswer = false;
 
   // Show widget + status bar on session start
@@ -333,11 +355,13 @@ export default function (pi: ExtensionAPI) {
     name: "ask_question",
     label: "ask_question",
     description:
-      "Ask the orchestrator (the parent agent that spawned you) a single question and pause until they reply. " +
+      "Ask the orchestrator (the parent agent that spawned you) a single question. " +
+      "This call BLOCKS until the orchestrator replies — the reply is returned as THIS tool's result (up to 10 minutes). " +
       "Use this when requirements are ambiguous, a decision would materially affect your work, you're blocked, " +
       "or you need information or confirmation only the orchestrator has. Prefer asking over guessing. " +
-      "Your session stays open while you wait — the answer arrives as your next message, then you continue. " +
-      "Ask exactly one question per call; make separate calls for unrelated questions.",
+      "If the call times out, the result says so and you decide whether to proceed with your best judgment or stop and summarize. " +
+      "Ask exactly one question per call; make separate calls for unrelated questions. " +
+      "Do NOT call ask_question again before the current call's result arrives.",
     promptSnippet:
       "Use this tool to ask the orchestrator one clarifying, missing-requirement, preference, or decision question before continuing — instead of guessing.",
     promptGuidelines: [
@@ -346,7 +370,9 @@ export default function (pi: ExtensionAPI) {
       "Prefer this tool over guessing when requirements, preferences, or implementation choices are unclear.",
       "Use it when multiple valid paths exist and the right one depends on the orchestrator's intent.",
       "Give enough context in the question that the orchestrator can answer without re-reading your whole task.",
-      "After asking, stop and wait — the reply will arrive as your next message.",
+      "The call blocks until the orchestrator replies — the reply arrives as this tool's result, so continue working with it as soon as the call returns.",
+      "Do not call ask_question again before the current call's result arrives.",
+      "If the call times out and the orchestrator replies later, that late reply arrives as a NEW message (a fresh turn), not as this call's result.",
     ],
     parameters: Type.Object({
       question: Type.String({
@@ -354,7 +380,7 @@ export default function (pi: ExtensionAPI) {
           "The single freeform question to ask the orchestrator. Include enough context to answer it directly.",
       }),
     }),
-    async execute(_toolCallId, params, _signal, _onUpdate, _ctx) {
+    async execute(_toolCallId, params, signal, _onUpdate, _ctx) {
       const sessionFile = process.env.PI_SUBAGENT_SESSION;
       if (!sessionFile) {
         throw new Error(
@@ -363,29 +389,159 @@ export default function (pi: ExtensionAPI) {
         );
       }
 
-      // Keep the session open: suppress auto-exit for this turn and park in the
-      // "waiting" phase. The parent's watcher picks up the `.ask` signal and
-      // notifies the orchestrator, who replies via subagent_message.
+      const askFile = `${sessionFile}.ask`;
+      const replyFile = `${sessionFile}.ask-reply`;
+
+      // Drop a stale reply from a previous question cycle so an old answer is
+      // never returned as the reply to THIS question.
+      try {
+        unlinkSync(replyFile);
+      } catch {}
+
+      // Keep the session open: suppress auto-exit while we wait for the
+      // orchestrator's reply. The parent's watcher picks up the `.ask`
+      // signal and notifies the orchestrator, who replies via
+      // subagent_message — the parent then writes `${sessionFile}.ask-reply`
+      // as JSON `{ askedAt, text }`, echoing our `askedAt` so this call can
+      // reject a reply that belongs to a different question cycle. The
+      // reply is consumed as this call's result.
       awaitingAnswer = true;
       recorder.askQuestion();
       const askData = {
         name: process.env.PI_SUBAGENT_NAME ?? "subagent",
         agent: process.env.PI_SUBAGENT_AGENT ?? "",
         question: params.question,
+        // Unique per question cycle; the parent's watcher dedupes its
+        // notification on this key (the .ask file may linger when the child
+        // is killed mid-wait, and a re-ask must still notify). The parent
+        // also echoes this value into the reply file for correlation.
+        askedAt: Date.now(),
       };
-      writeFileSync(`${sessionFile}.ask`, JSON.stringify(askData));
+      writeFileSync(askFile, JSON.stringify(askData));
+      const myAskedAt = askData.askedAt;
 
-      return {
-        content: [
-          {
-            type: "text",
-            text:
-              "Question sent to the orchestrator. Stop here and wait — do not continue working or " +
-              "assume an answer. Their reply will arrive as your next message.",
-          },
-        ],
-        details: { question: params.question },
+      /**
+       * Read the reply sidecar. The parent writes the reply as JSON
+       * `{ askedAt, text }`, echoing the `askedAt` it read from our `.ask`
+       * file. A reply carrying a different `askedAt` belongs to a different
+       * question cycle (a stale `.ask` outlived the child that wrote it) —
+       * drop it and keep waiting. Plain-text replies (legacy/tests) are
+       * accepted as-is.
+       */
+      const readReply = ():
+        | { kind: "reply"; text: string }
+        | { kind: "stale" }
+        | { kind: "none" } => {
+        let raw: string;
+        try {
+          raw = readFileSync(replyFile, "utf8");
+        } catch {
+          return { kind: "none" };
+        }
+        let parsed: any = null;
+        try {
+          parsed = JSON.parse(raw);
+        } catch {
+          parsed = null;
+        }
+        if (parsed && typeof parsed === "object" && !Array.isArray(parsed) && "text" in parsed) {
+          if (parsed.askedAt !== undefined) {
+            if (parsed.askedAt === myAskedAt) {
+              return { kind: "reply", text: typeof parsed.text === "string" ? parsed.text : raw };
+            }
+            // A reply for a different question cycle — drop it so it can't
+            // be consumed by mistake (it also can't linger into our next
+            // question: this call owns the file until it exits).
+            try {
+              unlinkSync(replyFile);
+            } catch {}
+            return { kind: "stale" };
+          }
+        }
+        return { kind: "reply", text: raw };
       };
+
+      const consumeReply = (text: string) => {
+        // The question was answered WITHIN this turn: clean up both
+        // sidecars and clear the flag. No new turn fires for the reply,
+        // so without the clear `agent_end` would park the session as
+        // `waiting` even though the answer already arrived and was
+        // consumed here.
+        try {
+          unlinkSync(replyFile);
+        } catch {}
+        try {
+          unlinkSync(askFile);
+        } catch {}
+        awaitingAnswer = false;
+        return {
+          content: [{ type: "text", text }],
+          details: { question: params.question, replied: true },
+        };
+      };
+
+      // Block until the reply file appears, the call is aborted, or the
+      // timeout elapses.
+      const pollMs = __test__.askQuestion.pollMs;
+      const timeoutMs = __test__.askQuestion.timeoutMs;
+      const startedAt = Date.now();
+      for (;;) {
+        // Reply FIRST, then abort: a reply that landed just before the
+        // Ctrl-C is preserved instead of being discarded.
+        const reply = readReply();
+        if (reply.kind === "reply") return consumeReply(reply.text);
+
+        if (signal?.aborted) {
+          // Catch a reply that landed in the same tick as the abort so the
+          // orchestrator's answer is preserved in the error instead of
+          // being silently dropped.
+          const lastReply = readReply();
+          const suffix =
+            lastReply.kind === "reply" ? ` A reply had just arrived: ${lastReply.text}` : "";
+          // Unlink `.ask` BEFORE throwing: we are no longer waiting, so the
+          // file no longer represents a pending question. Left in place it
+          // would misroute the orchestrator's next subagent_message —
+          // naturally the reply to this very question — into the
+          // `.ask-reply` sidecar, where it is silently swallowed. The
+          // `awaitingAnswer` backstop and the parent's `lastNotifiedAsk`
+          // dedupe make the cleanup safe; steers then fall back to typing
+          // into the pane (a fresh turn).
+          try {
+            unlinkSync(askFile);
+          } catch {}
+          try {
+            unlinkSync(replyFile);
+          } catch {}
+          throw new Error(`Interrupted while waiting for the orchestrator reply${suffix}`);
+        }
+
+        if (Date.now() - startedAt >= timeoutMs) {
+          // ONE FINAL read before giving up: a reply that landed after the
+          // last poll's read but before this check must be consumed here,
+          // not orphaned (it would otherwise be silently lost and purged
+          // as a stale reply by the next question cycle).
+          const lastReply = readReply();
+          if (lastReply.kind === "reply") return consumeReply(lastReply.text);
+          try {
+            unlinkSync(askFile);
+          } catch {}
+          awaitingAnswer = false;
+          const minutes = Math.max(1, Math.round(timeoutMs / 60000));
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  `No reply from the orchestrator within ${minutes} minute${minutes === 1 ? "" : "s"}. ` +
+                  "Proceed with your best judgment, or stop and summarize where you are.",
+              },
+            ],
+            details: { question: params.question, replied: false },
+          };
+        }
+
+        await new Promise((resolve) => setTimeout(resolve, pollMs));
+      }
     },
 
     renderCall(args, theme) {

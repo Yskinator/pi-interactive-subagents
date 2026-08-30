@@ -12,6 +12,7 @@ import {
   mkdirSync,
   copyFileSync,
   unlinkSync,
+  renameSync,
 } from "node:fs";
 import { homedir } from "node:os";
 import {
@@ -669,6 +670,21 @@ interface RunningSubagent {
    * subagent's pane (e.g. planner).
    */
   interactive: boolean;
+  /**
+   * Content key (askedAt|question) of the last delivered `ask_question`
+   * notification. The `.ask` file lingers until the child consumes the
+   * reply — or is left behind when the child is killed mid-wait — so
+   * dedupe is keyed on the payload content: an unchanged file does not
+   * re-notify, while a new question (or a re-ask) notifies again. See
+   * deliverPendingQuestion.
+   */
+  lastNotifiedAsk?: string;
+  /**
+   * Consecutive parse failures of the `.ask` file (reset on a successful
+   * parse). After ASK_PARSE_GIVE_UP_AFTER in a row the watcher unlinks the
+   * file instead of re-reading it every tick forever.
+   */
+  askParseFailures?: number;
 }
 
 /** All currently running subagents, keyed by id. */
@@ -1560,6 +1576,88 @@ function steerSubagent(
   }
 }
 
+/**
+ * Deliver a message to a running subagent.
+ *
+ * If the subagent is currently blocked in `ask_question` — its
+ * `${sessionFile}.ask` signal file exists AND its latest activity is the
+ * `ask_question` event (childIsAsking) — the message IS the orchestrator's
+ * reply: it is written atomically (temp file + rename) to
+ * `${sessionFile}.ask-reply` as JSON `{ askedAt, text }`, the `askedAt`
+ * echoed from the `.ask` file so the child can reject a reply from a
+ * different question cycle. Nothing is typed into the pane. Otherwise the
+ * message is typed into the live pane as a plain steer.
+ *
+ * Routing keys off the `.ask` file's existence (the parent cannot see the
+ * child's in-memory state), so a `.ask` that outlives the wait would
+ * misroute the next steer into the sidecar. That case is handled at the
+ * source: the child unlinks `.ask` on abort/timeout/consumption, the
+ * watcher unlinks both sidecars when the child's pane dies, and a resume
+ * unlinks them before relaunching — with the activity cross-check as a
+ * second line of defence for a live child that is not waiting.
+ */
+let askReplyTmpSeq = 0;
+
+/**
+ * Cross-check the `.ask` signal against the child's latest activity: a
+ * child blocked in `ask_question` has parked its activity at
+ * `latestEvent: "ask_question"`. A stale `.ask` (the child is no longer
+ * waiting) must not turn a plain steer into a swallowed reply. When the
+ * activity is unknown (file missing/unreadable) the `.ask` file itself —
+ * which the child writes immediately before blocking — is trusted.
+ */
+function childIsAsking(running: RunningSubagent): boolean {
+  const activityFile = running.activityFile;
+  if (!activityFile) return true; // unknown → trust the .ask signal
+  const read = readSubagentActivityFile(activityFile, running.id);
+  if (!read.ok) return true; // unknown → trust the .ask signal
+  return read.activity.latestEvent === "ask_question";
+}
+
+function deliverSubagentSteer(
+  running: RunningSubagent,
+  message: string,
+  send: (surface: string, command: string) => void = sendCommand,
+): { mode: "reply" } | { mode: "typed" } | { error: string } {
+  const askFile = `${running.sessionFile}.ask`;
+  if (existsSync(askFile) && childIsAsking(running)) {
+    // Echo the pending question's askedAt into the reply so the child can
+    // correlate it; the `.ask` file is authoritative for this cycle. A
+    // malformed file degrades to a plain-text reply (no askedAt), which
+    // the child accepts.
+    let askedAt: number | undefined;
+    try {
+      const payload = JSON.parse(readFileSync(askFile, "utf8"));
+      if (typeof payload?.askedAt === "number") askedAt = payload.askedAt;
+    } catch {}
+    const replyFile = `${running.sessionFile}.ask-reply`;
+    // The seq suffix keeps the temp name unique even for two
+    // subagent_message calls in the same millisecond (pid + ms alone
+    // would collide and the last rename would win, losing a reply).
+    const tmpFile = `${replyFile}.tmp-${process.pid}-${Date.now()}-${++askReplyTmpSeq}`;
+    const replyBody =
+      typeof askedAt === "number" ? JSON.stringify({ askedAt, text: message }) : message;
+    try {
+      writeFileSync(tmpFile, replyBody, "utf8");
+      renameSync(tmpFile, replyFile);
+    } catch (error: any) {
+      try {
+        unlinkSync(tmpFile);
+      } catch {}
+      return {
+        error:
+          `Failed to write the ask_question reply file for subagent "${running.name}": ` +
+          `${error?.message ?? String(error)}`,
+      };
+    }
+    return { mode: "reply" };
+  }
+
+  const steer = steerSubagent(running, message, send);
+  if ("error" in steer) return { error: steer.error };
+  return { mode: "typed" };
+}
+
 function handleSubagentSteer(
   params: { name?: string; message?: string },
   send: (surface: string, command: string) => void = sendCommand,
@@ -1582,23 +1680,37 @@ function handleSubagentSteer(
   const now = Date.now();
   observeRunningSubagent(running, now);
 
-  const steer = steerSubagent(running, message, send);
-  if ("error" in steer) {
+  const delivered = deliverSubagentSteer(running, message, send);
+  if ("error" in delivered) {
     return {
-      content: [{ type: "text" as const, text: steer.error }],
-      details: { error: steer.error, id: running.id, name: running.name },
+      content: [{ type: "text" as const, text: delivered.error }],
+      details: { error: delivered.error, id: running.id, name: running.name },
     };
   }
 
-  running.statusState = forceStatusAfterInterrupt(running.statusState, now);
+  // Only a pane-typed steer interrupts the child's TUI. A reply delivered via
+  // the `.ask-reply` sidecar is consumed inside the child's current turn, so
+  // its activity state is left to the activity observer.
+  if (delivered.mode === "typed") {
+    running.statusState = forceStatusAfterInterrupt(running.statusState, now);
+  }
   updateWidget();
+
+  // The ack is mode-specific: in reply mode the message is NOT picked up
+  // at a turn boundary — it is handed to the blocked call, which returns
+  // it as the tool result inside the child's current turn.
+  const ackText =
+    delivered.mode === "reply"
+      ? `Reply delivered to subagent "${running.name}": it unblocks the sub-agent's waiting ` +
+        `ask_question call, which returns your message as the tool result, and the ` +
+        `sub-agent continues with the answer in the same turn.`
+      : `Message delivered to running subagent "${running.name}". It picks this up at its next ` +
+        `turn boundary. If it exits, its result still arrives as a steer message.`;
 
   return {
     content: [{
       type: "text" as const,
-      text:
-        `Message delivered to running subagent "${running.name}". It picks this up at its next ` +
-        `turn boundary. If it exits, its result still arrives as a steer message.`,
+      text: ackText,
     }],
     details: { id: running.id, name: running.name, status: "steered" },
   };
@@ -1681,10 +1793,12 @@ export const __test__ = {
   observeRunningSubagent,
   getToolExtensionPath,
   resolveRunningByName,
+  deliverPendingQuestion,
   uniqueRunningName,
   reservedNames,
   steerSubagent,
   handleSubagentSteer,
+  deliverSubagentSteer,
   resolveResultPresentation,
   resolveResumeLaunchBehavior,
   runningSubagents,
@@ -2052,9 +2166,32 @@ function copyClaudeSession(sentinelFile: string): string | null {
  * Detect an `ask_question` signal from a still-running subagent and notify the
  * orchestrator without ending the subagent. Each subagent has its own
  * `${sessionFile}.ask` file and its own watcher, so parallel questions from
- * multiple subagents are delivered independently. The file is deleted after
- * delivery so it fires once per question (a subagent may ask again later).
+ * multiple subagents are delivered independently.
+ *
+ * The `.ask` file is deliberately NOT deleted here: the subagent's blocking
+ * `ask_question` call consumes the reply and unlinks the file itself, and the
+ * parent's `subagent_message` checks for the file (plus the child's activity,
+ * via childIsAsking) to route a reply into the
+ * `${sessionFile}.ask-reply` sidecar. Notification is still once per question
+ * — deduped by the payload content key (`lastNotifiedAsk`), so an unchanged
+ * lingering file does not re-notify, while a new question (or a re-ask)
+ * notifies again.
+ *
+ * A lingering `.ask` is NOT harmless for reply routing: a child that stops
+ * waiting without cleaning up (e.g. SIGKILL mid-wait) would otherwise keep
+ * steering the orchestrator's replies into the sidecar. That case is
+ * handled at the source — the child unlinks `.ask` on abort, the watcher
+ * unlinks both sidecars when the pane dies, and a resume unlinks them
+ * before relaunching — with the activity cross-check as a second line of
+ * defence for a live child that is not waiting.
+ *
+ * A `.ask` file that keeps failing to parse (e.g. the child died mid-write)
+ * is given up on: after a few consecutive parse failures the file is
+ * unlinked, so it neither clogs the notification loop forever nor keeps
+ * steering replies into the sidecar.
  */
+const ASK_PARSE_GIVE_UP_AFTER = 3;
+
 function deliverPendingQuestion(running: RunningSubagent): void {
   const askFile = `${running.sessionFile}.ask`;
   let payload: any = null;
@@ -2062,12 +2199,22 @@ function deliverPendingQuestion(running: RunningSubagent): void {
     if (!existsSync(askFile)) return;
     payload = JSON.parse(readFileSync(askFile, "utf-8"));
   } catch {
-    // Malformed/partway-written file — drop it and move on.
+    // Malformed/partway-written file. Tolerate a few ticks (the child may
+    // still be writing); give up after N consecutive failures.
+    running.askParseFailures = (running.askParseFailures ?? 0) + 1;
+    if (running.askParseFailures >= ASK_PARSE_GIVE_UP_AFTER) {
+      try {
+        unlinkSync(askFile);
+      } catch {}
+    }
+    return;
   }
-  try {
-    unlinkSync(askFile);
-  } catch {}
+  running.askParseFailures = 0;
   if (!payload?.question) return;
+
+  const askKey = `${payload.askedAt ?? ""}|${payload.question}`;
+  if (running.lastNotifiedAsk === askKey) return;
+  running.lastNotifiedAsk = askKey;
 
   const name = running.name; // unique per session (deduped at spawn) — targets the reply
   const sessionId = existsSync(running.sessionFile) ? getSessionId(running.sessionFile) : null;
@@ -2110,6 +2257,18 @@ async function watchSubagent(
     });
 
     const elapsed = Math.floor((Date.now() - startTime) / 1000);
+
+    // The pane is gone: any `.ask`/`.ask-reply` sidecars on this session
+    // file are stale — the child died without consuming them (e.g.
+    // SIGKILL while blocked in ask_question). Unlink them so a later
+    // resume of this session doesn't misroute its first steer into the
+    // reply sidecar or re-notify the dead question.
+    try {
+      unlinkSync(`${sessionFile}.ask`);
+    } catch {}
+    try {
+      unlinkSync(`${sessionFile}.ask-reply`);
+    } catch {}
 
     if (running.cli === "claude") {
       // Claude Code result extraction
@@ -2775,7 +2934,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 type: "text" as const,
                 text:
                   `Message delivered to chain "${requestedName}" (step ${chain.currentStep}/${chain.steps.length}: ${current.name}). ` +
-                  `It picks this up at its next turn boundary. The chain's aggregate result still arrives as a steer message when the chain finishes.`,
+                  `It is picked up at the step's next turn boundary — or, if the step is currently blocked in ask_question, it unblocks that call and is returned as the tool result. The chain's aggregate result still arrives as a steer message when the chain finishes.`,
               },
             ],
             details: { ...steer.details, chain: requestedName },
@@ -2811,6 +2970,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
             `Subagent "${requestedName}" is registered but its session file is gone ` +
             `(${sessionPath}). It cannot be resumed. Spawn a fresh subagent instead.`;
           return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+        }
+
+        // A child killed while blocked in ask_question leaves its
+        // `.ask`/`.ask-reply` sidecars on this session file. Unlink them
+        // before relaunching so the first steer to the resumed child is
+        // typed into the pane (not swallowed by the reply sidecar) and
+        // the fresh RunningSubagent doesn't re-notify the dead question.
+        for (const sidecar of [`${sessionPath}.ask`, `${sessionPath}.ask-reply`]) {
+          try {
+            unlinkSync(sidecar);
+          } catch {}
         }
 
         // Guard: never resume a session that is still running — two processes
