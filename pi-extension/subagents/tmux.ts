@@ -230,6 +230,25 @@ export async function readScreenAsync(surface: string, lines = 50): Promise<stri
 }
 
 /**
+ * True when the pane still exists.
+ *
+ * Used by the chain runner to notice a pane that was closed from outside
+ * (e.g. the user killed it to stop a chain) so the chain stops cleanly
+ * instead of polling a dead surface for the exit sentinel forever.
+ */
+export function isSurfaceAlive(surface: string): boolean {
+  try {
+    execFileSync("tmux", ["list-panes", "-t", surface, "-F", "#{pane_id}"], {
+      encoding: "utf8",
+      stdio: "ignore",
+    });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/**
  * Close a pane.
  */
 export function closeSurface(surface: string): void {

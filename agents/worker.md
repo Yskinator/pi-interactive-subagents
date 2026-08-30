@@ -1,9 +1,9 @@
 ---
 name: worker
 description: General-purpose worker — reads, writes, and edits code
-tools: read, write, edit, bash, web_search, web_fetch
-subagent_agents: scout, researcher
-model: openrouter/z-ai/glm-5.3
+tools: read, write, edit, bash
+subagent_agents: scout, reviewer
+model: vllm/qwen3.8-27b
 thinking: high
 system-prompt: append
 auto-exit: true

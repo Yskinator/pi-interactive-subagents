@@ -1,6 +1,6 @@
-import { describe, it, before, after, beforeEach } from "node:test";
+import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, utimesSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -57,6 +57,8 @@ import {
 } from "../pi-extension/subagents/subagent-done.ts";
 import subagentDoneExtension from "../pi-extension/subagents/subagent-done.ts";
 import { __pollForExitTest__ } from "../pi-extension/subagents/tmux.ts";
+import { searchSearxng, formatSearchResults, DEFAULT_SEARXNG_URL, waitForSearchSlot, rlStateFile, getMinIntervalMs } from "../pi-extension/subagents/tools/web-search/index.ts";
+import { __test__ as webFetchTest } from "../pi-extension/subagents/tools/web-fetch/index.ts";
 
 // --- Helpers ---
 
@@ -1172,8 +1174,8 @@ describe("subagent discovery", () => {
     );
   });
 
-  it("bundled scout/researcher/worker all resolve as non-interactive (auto-exit)", () => {
-    for (const name of ["scout", "researcher", "worker"]) {
+  it("bundled scout/researcher/worker/reviewer all resolve as non-interactive (auto-exit)", () => {
+    for (const name of ["scout", "researcher", "worker", "reviewer"]) {
       const defs = testApi.loadAgentDefaults(name);
       assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
       assert.equal(
@@ -1182,12 +1184,21 @@ describe("subagent discovery", () => {
         `${name} should resolve as non-interactive (autonomous, auto-exit)`,
       );
     }
+    // reviewer is read-only + read-only bash: it may inspect and diff, never modify.
+    const reviewer = testApi.loadAgentDefaults("reviewer");
+    const tools = new Set((reviewer.tools ?? "").split(",").map((t: string) => t.trim()).filter(Boolean));
+    for (const t of ["read", "grep", "find", "ls", "bash"]) {
+      assert.ok(tools.has(t), `expected reviewer tool ${t}`);
+    }
+    for (const t of ["write", "edit"]) {
+      assert.ok(!tools.has(t), `reviewer must not have ${t}`);
+    }
   });
 
-  it("worker is granted the spawning toolset restricted to scout and researcher", () => {
+  it("worker is granted the spawning toolset restricted to scout and reviewer", () => {
     const worker = testApi.loadAgentDefaults("worker");
     assert.ok(worker, "expected bundled worker to be discoverable");
-    assert.deepEqual(worker.subagentAgents, ["scout", "researcher"]);
+    assert.deepEqual(worker.subagentAgents, ["scout", "reviewer"]);
 
     const allowlist = testApi.buildSubagentToolAllowlist(worker.tools, { grantSpawning: true });
     assert.ok(allowlist, "expected an allowlist");
@@ -1196,10 +1207,13 @@ describe("subagent discovery", () => {
       assert.ok(tools.has(t), `expected spawning tool ${t} in worker allowlist`);
     }
     assert.ok(tools.has("bash"), "expected worker to keep bash");
+    // Policy: workers are pure implementers — no web tools of their own.
+    assert.ok(!tools.has("web_search"), "worker must not get web_search");
+    assert.ok(!tools.has("web_fetch"), "worker must not get web_fetch");
   });
 
-  it("scout and researcher are not granted spawning tools", () => {
-    for (const name of ["scout", "researcher"]) {
+  it("scout, researcher, and reviewer are not granted spawning tools", () => {
+    for (const name of ["scout", "researcher", "reviewer"]) {
       const defs = testApi.loadAgentDefaults(name);
       assert.ok(defs, `expected bundled agent ${name} to be discoverable`);
       assert.equal(defs.subagentAgents, undefined, `${name} should not declare subagent_agents`);
@@ -1209,7 +1223,8 @@ describe("subagent discovery", () => {
   it("getToolExtensionPath maps custom tools and skips built-ins", () => {
     assert.equal(testApi.getToolExtensionPath("read"), undefined);
     assert.equal(testApi.getToolExtensionPath("bash"), undefined);
-    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("web-search/index.ts"));
+    assert.ok(testApi.getToolExtensionPath("web_search")?.endsWith("tools/web-search/index.ts"));
+    assert.ok(testApi.getToolExtensionPath("web_fetch")?.endsWith("tools/web-fetch/index.ts"));
     assert.ok(testApi.getToolExtensionPath("safe_bash")?.endsWith("tools/safe-bash.ts"));
     // Spawning tools are registered by this extension itself.
     assert.ok(testApi.getToolExtensionPath("subagent")?.endsWith("index.ts"));
@@ -1824,15 +1839,16 @@ describe("tool registration", () => {
   });
 
 
-  it("rejects a top-level spawn with no agent and no fork", async () => {
+  it("rejects a top-level spawn with no agent and no chain", async () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
     const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
     assert.ok(subagentTool, "expected subagent tool to be registered");
 
     const result = await subagentTool.execute("call-1", { name: "x", task: "do it" });
-    assert.equal(result.details?.error, "agent required");
+    assert.equal(result.details?.error, "agent+task or chain required");
     assert.match(result.content[0].text, /specify which agent/i);
+    assert.match(result.content[0].text, /chain/i);
   });
 
   it("rejects a top-level spawn naming an unknown agent", async () => {
@@ -1850,7 +1866,7 @@ describe("tool registration", () => {
     assert.match(result.content[0].text, /not a known agent/i);
   });
 
-  it("exposes a debloated schema: agent+task required, name/model/cwd optional, no override knobs", () => {
+  it("exposes a debloated schema: agent/task optional (chain alternative), no override knobs", () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
 
@@ -1860,16 +1876,31 @@ describe("tool registration", () => {
     const props = subagentTool.parameters.properties;
     assert.deepEqual(
       Object.keys(props).sort(),
-      ["agent", "cwd", "model", "name", "task"],
-      "only agent/task/name/model/cwd should remain",
+      ["agent", "chain", "cwd", "model", "name", "task"],
+      "only agent/task/name/model/cwd/chain should remain",
     );
+    // Nothing is required at the schema level: the tool requires agent+task
+    // (single mode) or a non-empty chain and validates that itself.
     assert.deepEqual(
       [...(subagentTool.parameters.required ?? [])].sort(),
-      ["agent", "task"],
-      "agent and task must be required",
+      [],
+      "mode is validated in execute (agent+task or chain)",
     );
-    // `name` is now optional and purely cosmetic.
+    // `name` is optional and purely cosmetic.
     assert.match(props.name.description, /cosmetic/i);
+    // Chain steps require agent + task and document the automatic hand-off.
+    const stepProps = props.chain.items.properties;
+    assert.deepEqual(
+      Object.keys(stepProps).sort(),
+      ["agent", "cwd", "model", "name", "task"],
+      "chain steps take agent/task + the usual per-spawn options",
+    );
+    assert.deepEqual(
+      [...(props.chain.items.required ?? [])].sort(),
+      ["agent", "task"],
+      "each chain step must have an agent and a task",
+    );
+    assert.match(stepProps.task.description, /appended/i);
     // The removed override knobs must be gone.
     for (const gone of ["tools", "skills", "systemPrompt", "fork", "interactive", "resumeSessionId"]) {
       assert.equal(props[gone], undefined, `expected ${gone} param to be removed`);
@@ -1927,6 +1958,483 @@ describe("tool registration", () => {
     const names = registeredTools.map((tool) => tool.name);
     assert.equal(names.includes("subagent_interrupt"), false);
     assert.equal(names.includes("subagent_resume"), false);
+  });
+});
+
+describe("subagent chain", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  function chainSleep(ms: number): Promise<void> {
+    return new Promise((resolve) => setTimeout(resolve, ms));
+  }
+
+  let sessionDir: string;
+  let sessionId: string;
+
+  beforeEach(() => {
+    sessionDir = createTestDir();
+    sessionId = `sess-${Math.random().toString(36).slice(2)}`;
+  });
+
+  afterEach(() => {
+    testApi.stopTimersForTest();
+    try {
+      rmSync(sessionDir, { recursive: true, force: true });
+    } catch {}
+  });
+
+  function mockCtx() {
+    return {
+      sessionManager: {
+        getSessionFile: () => join(sessionDir, "session.jsonl"),
+        getSessionId: () => sessionId,
+        getSessionDir: () => sessionDir,
+      },
+      cwd: sessionDir,
+    } as any;
+  }
+
+  /** A fake RunningSubagent registered in runningSubagents so steering can resolve it. */
+  function makeFakeRunning(name: string) {
+    const fake: any = {
+      id: `fake-${Math.random().toString(36).slice(2)}`,
+      name,
+      surface: "%stub",
+      startTime: Date.now(),
+      sessionFile: join(sessionDir, `sub-${name}.jsonl`),
+      interactive: false,
+    };
+    fake.statusState = createStatusState({ source: "pi", startTimeMs: fake.startTime });
+    return fake;
+  }
+
+  // ── buildChainStepTask: automatic output hand-off ──
+
+  it("returns the task unchanged for the first step (no previous output)", () => {
+    assert.equal(testApi.buildChainStepTask("do the thing", null), "do the thing");
+  });
+
+  it("appends the previous step's output to the next step's task", () => {
+    const task = testApi.buildChainStepTask("review the implementation", {
+      agent: "worker",
+      stepIndex: 1,
+      output: "## Changes Made\n- added X",
+    });
+    assert.ok(task.startsWith("review the implementation"), "the step's own task comes first");
+    assert.ok(task.includes("## Output from previous step (step 1: worker)"));
+    assert.ok(task.endsWith("## Changes Made\n- added X"));
+    // The caller never supplies a {previous} placeholder.
+    assert.ok(!task.includes("{previous}"));
+  });
+
+  it("does not append anything when the previous output is empty", () => {
+    const task = testApi.buildChainStepTask("next step", {
+      agent: "worker",
+      stepIndex: 1,
+      output: "   ",
+    });
+    assert.equal(task, "next step");
+  });
+
+  it("caps long non-final step outputs in the presentation", () => {
+    assert.equal(testApi.truncateChainOutput("short", 100), "short");
+    const long = testApi.truncateChainOutput("x".repeat(200), 100);
+    assert.ok(long.length < 200);
+    assert.match(long, /truncated/);
+  });
+
+  // ── Validation (no tmux panes involved) ──
+
+  it("rejects mixing single-spawn params with a chain", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const result = await subagentTool.execute(
+      "call-1",
+      { agent: "worker", task: "solo", chain: [{ agent: "worker", task: "a" }] },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+    assert.equal(result.details?.error, "chain and single spawn are mutually exclusive");
+  });
+
+  it("rejects a chain step naming an unknown agent (before launching anything)", async () => {
+    const { api, registeredTools, sentMessages } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const original = testApi.chainHooks.runStep;
+    let stepCalls = 0;
+    testApi.chainHooks.runStep = async () => {
+      stepCalls++;
+    };
+    try {
+      const result = await subagentTool.execute(
+        "call-1",
+        { chain: [{ agent: "worker", task: "a" }, { agent: "wizard", task: "b" }] },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.match(result.details?.error, /unknown chain agent|not in allowlist/);
+      assert.equal(result.details?.step, 2);
+    } finally {
+      testApi.chainHooks.runStep = original;
+    }
+    assert.equal(stepCalls, 0, "no step should have launched");
+    assert.equal(sentMessages.length, 0, "no steer should have been sent");
+  });
+
+  it("rejects a chain step missing a task", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const result = await subagentTool.execute(
+      "call-1",
+      { chain: [{ agent: "worker", task: "a" }, { agent: "reviewer" }] as any },
+      undefined,
+      undefined,
+      mockCtx(),
+    );
+    assert.equal(result.details?.error, "chain step missing task");
+    assert.equal(result.details?.step, 2);
+  });
+
+  it("rejects a chain longer than the max step count", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const many = Array.from(
+      { length: testApi.MAX_CHAIN_STEPS + 1 },
+      (_, i) => ({ agent: "scout", task: `t${i}` }),
+    );
+    const result = await subagentTool.execute("call-1", { chain: many }, undefined, undefined, mockCtx());
+    assert.equal(result.details?.error, "chain too long");
+  });
+
+  // ── Orchestration (stubbed step runner — no real tmux panes) ──
+
+  it("runs steps in order, defaulting names, and appends each output to the next task", async () => {
+    const { api, registeredTools, sentMessages } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const calls: any[] = [];
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any, _ctx: any, parentArtifactDir: any) => {
+      calls.push({ agent: step.agent, task: step.task, name: step.name });
+      registerName(parentArtifactDir, step.name, {
+        sessionFile: join(sessionDir, `sub-${step.name}.jsonl`),
+        sessionId: null,
+      });
+      return {
+        name: step.name,
+        summary: `SUMMARY-${calls.length}`,
+        exitCode: 0,
+        elapsed: 2,
+        sessionFile: join(sessionDir, `sub-${step.name}.jsonl`),
+      };
+    };
+    try {
+      const ack = await subagentTool.execute(
+        "call-1",
+        {
+          name: "test-chain",
+          chain: [
+            { agent: "worker", task: "implement X" },
+            { agent: "reviewer", task: "review it" },
+            { agent: "worker", task: "apply the feedback" },
+          ],
+        },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(ack.details?.status, "chain-started");
+      assert.equal(ack.details?.chainName, "test-chain");
+      assert.match(ack.content[0].text, /Chain "test-chain" started: 3 steps \(worker → reviewer → worker\)/);
+      assert.match(ack.content[0].text, /automatically appended/i);
+
+      // The chain drives itself; let it finish (stub resolves immediately).
+      for (let i = 0; i < 20; i++) {
+        if (sentMessages.length > 0) break;
+        await chainSleep(10);
+      }
+
+      assert.equal(calls.length, 3, "all three steps should have run");
+      assert.deepEqual(
+        calls.map((c) => c.agent),
+        ["worker", "reviewer", "worker"],
+        "steps run in the requested order",
+      );
+      assert.deepEqual(
+        calls.map((c) => c.name),
+        ["worker", "reviewer", "worker-2"],
+        "default step names are auto-suffixed on collision",
+      );
+
+      // Automatic hand-off: each task starts with its own task and ends with
+      // the previous step's output — no placeholder, no manual pasting.
+      assert.ok(calls[1].task.startsWith("review it"));
+      assert.ok(calls[1].task.includes("## Output from previous step (step 1: worker)"));
+      assert.ok(calls[1].task.endsWith("SUMMARY-1"));
+      assert.ok(calls[2].task.startsWith("apply the feedback"));
+      assert.ok(calls[2].task.includes("## Output from previous step (step 2: reviewer)"));
+      assert.ok(calls[2].task.endsWith("SUMMARY-2"));
+      assert.ok(!calls[0].task.includes("Output from previous step"), "first step gets no appended context");
+
+      // Exactly ONE steer: the aggregate chain result (no per-step steers).
+      assert.equal(sentMessages.length, 1, "only the aggregate chain steer is sent");
+      const steer = sentMessages[0].message;
+      assert.equal(steer.customType, "subagent_result");
+      assert.equal(steer.details.chain, true);
+      assert.equal(steer.details.name, "test-chain");
+      assert.equal(steer.details.exitCode, 0);
+      assert.equal(steer.details.steps.length, 3);
+      assert.deepEqual(
+        steer.details.steps.map((s: any) => s.status),
+        ["completed", "completed", "completed"],
+      );
+      assert.match(steer.content, /Chain "test-chain" completed: 3\/3 steps/);
+      assert.match(steer.content, /## Step 1\/3: worker \(worker\) — completed/);
+      assert.match(steer.content, /## Step 2\/3: reviewer \(reviewer\) — completed/);
+      assert.match(steer.content, /## Step 3\/3: worker \(worker-2\) — completed/);
+      assert.match(steer.content, /SUMMARY-1/);
+      assert.match(steer.content, /SUMMARY-2/);
+      assert.match(steer.content, /SUMMARY-3/);
+      assert.match(steer.content, /subagent_message\(\{ name: "worker-2"/);
+      assert.deepEqual(sentMessages[0].options, { triggerTurn: true, deliverAs: "steer" });
+    } finally {
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("stops the chain when a step fails and reports what was and was not run", async () => {
+    const { api, registeredTools, sentMessages } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const calls: any[] = [];
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any, _ctx: any, parentArtifactDir: any) => {
+      calls.push(step.agent);
+      registerName(parentArtifactDir, step.name, { sessionFile: join(sessionDir, `sub.jsonl`), sessionId: null });
+      if (step.agent === "reviewer") {
+        return { name: step.name, summary: "reviewing…", exitCode: 1, elapsed: 1, errorMessage: "provider overloaded" };
+      }
+      return { name: step.name, summary: `SUMMARY-${calls.length}`, exitCode: 0, elapsed: 2, sessionFile: join(sessionDir, `sub.jsonl`) };
+    };
+    try {
+      await subagentTool.execute(
+        "call-1",
+        {
+          name: "fail-chain",
+          chain: [
+            { agent: "worker", task: "implement X" },
+            { agent: "reviewer", task: "review it" },
+            { agent: "worker", task: "apply the feedback" },
+          ],
+        },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+
+      for (let i = 0; i < 20; i++) {
+        if (sentMessages.length > 0) break;
+        await chainSleep(10);
+      }
+
+      assert.deepEqual(calls, ["worker", "reviewer"], "the step after the failure must not run");
+      assert.equal(sentMessages.length, 1);
+      const steer = sentMessages[0].message;
+      assert.equal(steer.details.chain, true);
+      assert.equal(steer.details.exitCode, 1);
+      assert.deepEqual(
+        steer.details.steps.map((s: any) => s.status),
+        ["completed", "failed", "skipped"],
+      );
+      assert.match(steer.content, /stopped at step 2\/3 \(reviewer\) — provider\/agent error: provider overloaded/);
+      assert.match(steer.content, /Not run \(chain stopped early\): worker/);
+      assert.match(steer.content, /SUMMARY-1/, "completed steps' outputs are still included");
+    } finally {
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("marks the chain cancelled when aborted mid-step and skips the rest", async () => {
+    const { api, registeredTools, sentMessages } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const calls: any[] = [];
+    let releaseGate: () => void;
+    const gate = new Promise<void>((r) => (releaseGate = r));
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any, _ctx: any, parentArtifactDir: any, _pi: any, signal: AbortSignal, hooks: any) => {
+      hooks.onLaunched(makeFakeRunning(step.name));
+      calls.push(step.agent);
+      registerName(parentArtifactDir, step.name, { sessionFile: join(sessionDir, `sub.jsonl`), sessionId: null });
+      if (calls.length === 1) {
+        await Promise.race([
+          gate,
+          new Promise<void>((r) => signal.addEventListener("abort", () => r(), { once: true })),
+        ]);
+        if (signal.aborted) {
+          return { name: step.name, summary: "Subagent cancelled.", exitCode: 1, elapsed: 1 };
+        }
+      }
+      return { name: step.name, summary: `SUMMARY-${calls.length}`, exitCode: 0, elapsed: 2 };
+    };
+    try {
+      await subagentTool.execute(
+        "call-1",
+        {
+          name: "abort-chain",
+          chain: [
+            { agent: "worker", task: "implement X" },
+            { agent: "reviewer", task: "review it" },
+          ],
+        },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+
+      // Wait until step 1 is running, then abort the chain.
+      const chains = testApi.getChainMapForSession(sessionId);
+      const chain = chains.get("abort-chain");
+      assert.ok(chain, "chain should be tracked for this session");
+      for (let i = 0; i < 50 && chain.currentStep === 0; i++) await chainSleep(10);
+      assert.equal(chain.currentStep, 1, "step 1 should be running");
+      chain.aborted = true;
+      chain.abortController.abort();
+
+      for (let i = 0; i < 20; i++) {
+        if (sentMessages.length > 0) break;
+        await chainSleep(10);
+      }
+
+      assert.deepEqual(calls, ["worker"], "step 2 must not run after abort");
+      assert.equal(sentMessages.length, 1);
+      const steer = sentMessages[0].message;
+      assert.equal(steer.details.cancelled, true);
+      assert.equal(steer.details.exitCode, 1);
+      assert.deepEqual(
+        steer.details.steps.map((s: any) => s.status),
+        ["cancelled", "skipped"],
+      );
+      assert.match(steer.content, /was cancelled \(parent session shut down\)/);
+    } finally {
+      releaseGate?.();
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  // ── subagent_message addressing of chains ──
+
+  it("reports a finished chain by name and points at its steps", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const messageTool = registeredTools.find((tool) => tool.name === "subagent_message");
+
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any, _ctx: any, parentArtifactDir: any) => {
+      registerName(parentArtifactDir, step.name, { sessionFile: join(sessionDir, `sub.jsonl`), sessionId: null });
+      return { name: step.name, summary: `SUMMARY-${step.agent}`, exitCode: 0, elapsed: 1 };
+    };
+    try {
+      await subagentTool.execute(
+        "call-1",
+        {
+          name: "msg-chain",
+          chain: [
+            { agent: "worker", task: "implement X" },
+            { agent: "reviewer", task: "review it" },
+          ],
+        },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      // Let the chain finish.
+      const chains = testApi.getChainMapForSession(sessionId);
+      const chain = chains.get("msg-chain");
+      for (let i = 0; i < 50 && !chain.finished; i++) await chainSleep(10);
+      assert.ok(chain.finished, "chain should have finished");
+
+      const result = await messageTool.execute("call-2", { name: "msg-chain", message: "keep going" }, undefined, undefined, mockCtx());
+      assert.equal(result.details?.error, "chain finished");
+      assert.match(result.content[0].text, /has already finished/);
+      assert.match(result.content[0].text, /worker/);
+      assert.match(result.content[0].text, /reviewer/);
+    } finally {
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("delivers a message for an active chain to its currently running step", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const messageTool = registeredTools.find((tool) => tool.name === "subagent_message");
+
+    let releaseGate: () => void;
+    const gate = new Promise<void>((r) => (releaseGate = r));
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any, _ctx: any, parentArtifactDir: any, _pi: any, signal: AbortSignal, hooks: any) => {
+      const fake = makeFakeRunning(step.name);
+      hooks.onLaunched(fake);
+      testApi.runningSubagents.set(fake.id, fake);
+      registerName(parentArtifactDir, step.name, { sessionFile: fake.sessionFile, sessionId: null });
+      await Promise.race([
+        gate,
+        new Promise<void>((r) => signal.addEventListener("abort", () => r(), { once: true })),
+      ]);
+      testApi.runningSubagents.delete(fake.id);
+      if (signal.aborted) return { name: step.name, summary: "Subagent cancelled.", exitCode: 1, elapsed: 1 };
+      return { name: step.name, summary: `SUMMARY-${step.agent}`, exitCode: 0, elapsed: 1 };
+    };
+    try {
+      await subagentTool.execute(
+        "call-1",
+        {
+          name: "steer-chain",
+          chain: [
+            { agent: "worker", task: "implement X" },
+            { agent: "reviewer", task: "review it" },
+          ],
+        },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      const chain = testApi.getChainMapForSession(sessionId).get("steer-chain");
+      for (let i = 0; i < 50 && chain.currentStep === 0; i++) await chainSleep(10);
+      assert.equal(chain.currentStep, 1);
+
+      // The chain name resolves to the running step. (Delivery to the fake
+      // "%stub" surface fails in this environment — that's fine: the point is
+      // that the chain branch routed the message to the step, not that the
+      // name was unknown or the chain finished.)
+      const result = await messageTool.execute("call-2", { name: "steer-chain", message: "hurry up" }, undefined, undefined, mockCtx());
+      assert.match(result.content[0].text, /Failed to deliver message to subagent "worker" via tmux/);
+
+      // Abort + release so the chain cleans up.
+      chain.aborted = true;
+      chain.abortController.abort();
+      releaseGate();
+      await chainSleep(30);
+    } finally {
+      releaseGate?.();
+      testApi.chainHooks.runStep = original;
+      testApi.runningSubagents.clear();
+    }
   });
 });
 
@@ -2673,6 +3181,296 @@ describe("tmux.ts", () => {
       assert.ok(escaped.endsWith("'"));
       // Inside single quotes, everything is literal
       assert.ok(escaped.includes("$world"));
+    });
+  });
+});
+
+describe("web tools (web_search / web_fetch)", () => {
+  const sampleData = {
+    query: "pi coding agent",
+    results: [
+      { title: "Pi Coding Agent", url: "https://pi.dev/", snippet: "  Pi is a minimal\nagent harness.\n" },
+      { title: "GitHub - pi", url: "https://github.com/earendil-works/pi", snippet: "" },
+    ],
+    answers: [],
+    unresponsiveEngines: [],
+  };
+
+  const jsonFetch = (payload: unknown): typeof fetch =>
+    (async () =>
+      new Response(JSON.stringify(payload), {
+        status: 200,
+        headers: { "content-type": "application/json" },
+      })) as typeof fetch;
+
+  describe("web_search", () => {
+    it("builds the SearXNG request and maps results", async () => {
+      let seenUrl: URL | null = null;
+      const fetchImpl = (async (input: any) => {
+        seenUrl = new URL(input);
+        return new Response(
+          JSON.stringify({ query: "q", results: sampleData.results.map((r) => ({ title: r.title, url: r.url, content: r.snippet })), answers: [], unresponsive_engines: [] }),
+          { status: 200 },
+        );
+      }) as typeof fetch;
+      const data = await searchSearxng("pi coding agent", 5, {
+        fetchImpl,
+        baseUrl: "http://sx.local/",
+      });
+      assert.ok(seenUrl);
+      assert.equal(seenUrl.origin, "http://sx.local");
+      assert.equal(seenUrl.pathname, "/search");
+      assert.equal(seenUrl.searchParams.get("q"), "pi coding agent");
+      assert.equal(seenUrl.searchParams.get("format"), "json");
+      assert.equal(data.results.length, 2);
+      assert.equal(data.results[0].url, "https://pi.dev/");
+      assert.equal(data.unresponsiveEngines.length, 0);
+    });
+
+    it("clamps count to 1..10", async () => {
+      const many = Array.from({ length: 15 }, (_, i) => ({
+        title: `t${i}`,
+        url: `https://e.com/${i}`,
+        content: `s${i}`,
+      }));
+      const data = await searchSearxng("q", 99, {
+        fetchImpl: jsonFetch({ results: many }),
+      });
+      assert.equal(data.results.length, 10);
+      const one = await searchSearxng("q", 0, {
+        fetchImpl: jsonFetch({ results: many }),
+      });
+      assert.equal(one.results.length, 1);
+    });
+
+    it("uses SEARXNG_URL env for the endpoint", async () => {
+      const prev = process.env.SEARXNG_URL;
+      process.env.SEARXNG_URL = "http://custom:9999/";
+      try {
+        let seenUrl: URL | null = null;
+        const fetchImpl = (async (input: any) => {
+          seenUrl = new URL(input);
+          return new Response(JSON.stringify({ results: [] }), { status: 200 });
+        }) as typeof fetch;
+        await searchSearxng("q", 3, { fetchImpl });
+        assert.equal(seenUrl!.origin, "http://custom:9999");
+      } finally {
+        if (prev === undefined) delete process.env.SEARXNG_URL;
+        else process.env.SEARXNG_URL = prev;
+      }
+    });
+
+    it("defaults to the docker-bridge SearXNG URL when no env is set", () => {
+      assert.equal(DEFAULT_SEARXNG_URL, "http://host.docker.internal:8088");
+    });
+
+    it("formats numbered results, answers, and engine notes", () => {
+      const { text } = formatSearchResults(sampleData);
+      assert.match(text, /1\. Pi Coding Agent\n   https:\/\/pi\.dev\//);
+      assert.match(text, /2\. GitHub - pi/);
+      assert.match(text, /Pi is a minimal agent harness\./); // flattened snippet
+      const withNotes = formatSearchResults({
+        ...sampleData,
+        answers: ["Pi is a coding agent."],
+        unresponsiveEngines: ["brave", "google"],
+      });
+      assert.match(withNotes.text, /Answers:\n- Pi is a coding agent\./);
+      assert.match(withNotes.text, /upstream engines were temporarily unavailable — brave, google/);
+    });
+
+    it("distinguishes 'no results' from 'engines down' when empty", () => {
+      const empty = formatSearchResults({ ...sampleData, results: [] });
+      assert.match(empty.text, /No results found for "pi coding agent"\./);
+      const down = formatSearchResults({
+        ...sampleData,
+        results: [],
+        unresponsiveEngines: ["google"],
+      });
+      assert.match(down.text, /upstream engines are temporarily unavailable \(google\)/);
+      assert.match(down.text, /Retry in a minute/);
+    });
+
+    it("throws a helpful error when the instance is unreachable", async () => {
+      const fetchImpl = (async () => {
+        throw new Error("fetch failed");
+      }) as typeof fetch;
+      await assert.rejects(
+        searchSearxng("q", 3, { fetchImpl }),
+        /SearXNG unreachable at http:\/\/host\.docker\.internal:8088: fetch failed/,
+      );
+    });
+
+    it("throws on HTTP errors and non-JSON responses", async () => {
+      const httpErr = (async () =>
+        new Response("Forbidden", { status: 403 })) as typeof fetch;
+      await assert.rejects(searchSearxng("q", 3, { fetchImpl: httpErr }), /HTTP 403/);
+      const notJson = (async () =>
+        new Response("<html>nope</html>", { status: 200 })) as typeof fetch;
+      await assert.rejects(
+        searchSearxng("q", 3, { fetchImpl: notJson }),
+        /non-JSON/,
+      );
+    });
+
+    describe("cross-process rate limiter", () => {
+      let dir: string;
+      let prevIntervalEnv: string | undefined;
+      let prevDirEnv: string | undefined;
+      before(() => {
+        dir = mkdtempSync(join(tmpdir(), "websearch-rl-"));
+        prevIntervalEnv = process.env.WEB_SEARCH_MIN_INTERVAL_S;
+        prevDirEnv = process.env.WEB_SEARCH_RL_DIR;
+      });
+      after(() => {
+        rmSync(dir, { recursive: true, force: true });
+        if (prevIntervalEnv === undefined) delete process.env.WEB_SEARCH_MIN_INTERVAL_S;
+        else process.env.WEB_SEARCH_MIN_INTERVAL_S = prevIntervalEnv;
+        if (prevDirEnv === undefined) delete process.env.WEB_SEARCH_RL_DIR;
+        else process.env.WEB_SEARCH_RL_DIR = prevDirEnv;
+      });
+      beforeEach(() => {
+        process.env.WEB_SEARCH_RL_DIR = dir;
+      });
+
+      const stateFile = (tag: string) => join(dir, `state-${tag}.json`);
+
+      it("is disabled when the interval is 0", async () => {
+        const sf = stateFile("off");
+        const waited = await waitForSearchSlot("http://sx", { intervalMs: 0, stateFile: sf });
+        assert.equal(waited, 0);
+        assert.ok(!existsSync(sf), "no state file should be written when disabled");
+      });
+
+      it("paces a second call to the full interval", async () => {
+        const sf = stateFile("pace");
+        const INTERVAL = 2000;
+        const t0 = Date.now();
+        const first = await waitForSearchSlot("http://sx", { intervalMs: INTERVAL, stateFile: sf });
+        assert.ok(first < 300, `first call should not wait (waited ${first}ms)`);
+
+        const t1 = Date.now();
+        const second = await waitForSearchSlot("http://sx", { intervalMs: INTERVAL, stateFile: sf });
+        const elapsedBetween = Date.now() - t1;
+        assert.ok(second >= INTERVAL - 300, `second call should wait ~interval (waited ${second}ms)`);
+        // The state file should now record a lastRequest ~interval after the first.
+        const data = JSON.parse(readFileSync(sf, "utf8"));
+        assert.ok(typeof data.lastRequest === "number");
+      });
+
+      it("aborts while waiting for the slot", async () => {
+        const sf = stateFile("abort");
+        const INTERVAL = 60000;
+        // Prime the slot so the next call must wait.
+        await waitForSearchSlot("http://sx", { intervalMs: INTERVAL, stateFile: sf });
+        const ac = new AbortController();
+        setTimeout(() => ac.abort(), 200);
+        await assert.rejects(
+          waitForSearchSlot("http://sx", { intervalMs: INTERVAL, stateFile: sf, signal: ac.signal }),
+          /rate limit/,
+        );
+      });
+
+      it("keys state per SearXNG URL", () => {
+        process.env.WEB_SEARCH_RL_DIR = dir;
+        assert.notEqual(rlStateFile("http://a"), rlStateFile("http://b"));
+      });
+
+      it("recovers from a stale lock", async () => {
+        const sf = stateFile("stale");
+        const lock = sf + ".lock";
+        const INTERVAL = 2000;
+        // Old lastRequest so no interval wait is due — the ONLY obstacle is the stale lock.
+        writeFileSync(sf, JSON.stringify({ lastRequest: Date.now() - 10 * 60 * 1000 }));
+        writeFileSync(lock, "999999");
+        const old = new Date(Date.now() - 5 * 60 * 1000);
+        utimesSync(lock, old, old);
+        const t0 = Date.now();
+        await waitForSearchSlot("http://sx", { intervalMs: INTERVAL, stateFile: sf });
+        assert.ok(
+          Date.now() - t0 < 1000,
+          `should proceed without waiting when only a stale lock is present (took ${Date.now() - t0}ms)`,
+        );
+        assert.ok(!existsSync(lock), "stale lock should be cleaned up");
+      });
+
+      it("reads the interval from WEB_SEARCH_MIN_INTERVAL_S", () => {
+        process.env.WEB_SEARCH_MIN_INTERVAL_S = "0";
+        assert.equal(getMinIntervalMs(), 0);
+        process.env.WEB_SEARCH_MIN_INTERVAL_S = "2.5";
+        assert.equal(getMinIntervalMs(), 2500);
+        process.env.WEB_SEARCH_MIN_INTERVAL_S = "not-a-number";
+        assert.equal(getMinIntervalMs(), 61000);
+        delete process.env.WEB_SEARCH_MIN_INTERVAL_S;
+        assert.equal(getMinIntervalMs(), 61000);
+      });
+    });
+  });
+
+  describe("web_fetch", () => {
+    let origFetch: typeof fetch;
+    before(() => {
+      origFetch = globalThis.fetch;
+    });
+    after(() => {
+      globalThis.fetch = origFetch;
+    });
+
+    it("rejects invalid URLs without touching the network", async () => {
+      globalThis.fetch = (async () => {
+        throw new Error("should not be called");
+      }) as typeof fetch;
+      const r = await webFetchTest.fetchAndExtract("not a url");
+      assert.equal(r.error, "Invalid URL");
+    });
+
+    it("extracts a readable HTML page to markdown", async () => {
+      const html = [
+        "<html><head><title>Test Page Title</title></head><body>",
+        "<article>",
+        "<h1>Test Page Heading</h1>",
+        ...Array.from({ length: 20 }, (_, i) => `<p>Paragraph ${i} with some content to make readability happy about this page. The text goes on and on, well past any minimum threshold, so extraction succeeds.</p>`),
+        "</article></body></html>",
+      ].join("");
+      globalThis.fetch = (async () =>
+        new Response(html, {
+          status: 200,
+          headers: { "content-type": "text/html" },
+        })) as typeof fetch;
+      const r = await webFetchTest.fetchAndExtract("https://example.com/page");
+      assert.equal(r.error, null);
+      assert.equal(r.title, "Test Page Title"); // <title> wins over h1
+      assert.match(r.content, /# Test Page Heading/);
+      assert.match(r.content, /Paragraph 5/);
+    });
+
+    it("fails locally on HTTP errors — no external fallback calls", async () => {
+      let calls = 0;
+      globalThis.fetch = (async (input: any) => {
+        calls++;
+        const url = String(input);
+        assert.doesNotMatch(url, /jina/);
+        return new Response("Not Found", { status: 404, statusText: "Not Found" });
+      }) as typeof fetch;
+      const r = await webFetchTest.fetchAndExtract("https://example.com/missing");
+      assert.match(r.error ?? "", /HTTP 404/);
+      assert.match(r.error ?? "", /may be JavaScript-rendered or otherwise unfetchable/);
+      assert.equal(calls, 1, "must not phone out to any fallback service");
+    });
+
+    it("flags likely JS-rendered pages", () => {
+      const jsPage = "<html><body><div id='root'></div>" +
+        "<script>var a=1;</script><script>var b=2;</script><script>var c=3;</script><script>var d=4;</script>" +
+        "</body></html>";
+      assert.equal(webFetchTest.isLikelyJSRendered(jsPage), true);
+      const textPage =
+        "<html><body><p>" + "real text content ".repeat(40) + "</p></body></html>";
+      assert.equal(webFetchTest.isLikelyJSRendered(textPage), false);
+    });
+
+    it("detects PDFs by content type and URL suffix", () => {
+      assert.equal(webFetchTest.isPDF("https://x.com/a.pdf"), true);
+      assert.equal(webFetchTest.isPDF("https://x.com/a", "application/pdf"), true);
+      assert.equal(webFetchTest.isPDF("https://x.com/a", "text/html"), false);
     });
   });
 });

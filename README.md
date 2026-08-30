@@ -45,11 +45,36 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 
 | Parameter | Type | Default | Description |
 | --------- | ---- | ------- | ----------- |
-| `agent` | string | required | Which agent to spawn (must be known and permitted) |
-| `task` | string | required | Task prompt |
-| `name` | string | agent name | Display name for the pane and widget. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …) |
+| `agent` | string | required (single mode) | Which agent to spawn (must be known and permitted) |
+| `task` | string | required (single mode) | Task prompt |
+| `name` | string | agent name | Display name for the pane and widget. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …). In chain mode this names the **chain** (its steps get their own names) |
 | `model` | string | agent's model | Override the model for this spawn |
 | `cwd` | string | agent's `cwd` | Working directory (see [Role folders](#role-folders)) |
+| `chain` | `{agent, task, name?, model?, cwd?}[]` | — | Run a sequence of subagents one after another instead of a single spawn (see [Chains](#chains)) |
+
+### Chains
+
+Run subagents sequentially — e.g. `worker → reviewer → worker` — with the previous step's output **automatically appended** to the next step's task. The hand-off is driven by the extension, so the previous step's report can never be forgotten: there is no `{previous}` placeholder for the caller to add, and no pasting of prior output into the next task.
+
+```typescript
+subagent({
+  name: "fix-auth",
+  chain: [
+    { agent: "worker",   task: "Implement the auth fix" },
+    { agent: "reviewer", task: "Review the implementation" },
+    { agent: "worker",   task: "Apply the review feedback" },
+  ],
+});
+```
+
+How it works:
+
+- Each step runs in its own pane, tracked by the widget like any other subagent. Steps run **one after another**, in the order given (max 10 steps).
+- Step N's final assistant message is appended to step N+1's task under an `## Output from previous step (step N: agent)` heading. An empty output appends nothing.
+- Like every other spawn, the tool call is **fire-and-forget**: it returns an acknowledgement immediately, and ONE aggregate result for the whole chain — every step's status and output — is delivered as a steer message when the last step finishes, or when the chain stops early because a step failed. Do not poll; just wait for the steer.
+- If a step fails (non-zero exit, provider error, or its pane was closed), the remaining steps are marked `skipped` and the aggregate steer says exactly where the chain stopped and what never ran.
+- Steps are addressable by their names (auto-suffixed on collision, e.g. `worker`, `reviewer`, `worker-2`) via `subagent_message`, as usual. A message to the **chain name** is delivered to the chain's currently running step; a message to a finished chain's name gets an error pointing at its steps.
+- Per-step `model`, `cwd`, and cosmetic `name` overrides work the same as for single spawns.
 
 ### Messaging
 
@@ -76,11 +101,21 @@ If the reply arrives while the sub-agent is still mid-turn, it is absorbed into 
 
 | Agent | Model | Tools | Role |
 | ----- | ----- | ----- | ---- |
-| **scout** | `openrouter/z-ai/glm-5.3` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
-| **researcher** | `openrouter/z-ai/glm-5.3` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
-| **worker** | `openrouter/z-ai/glm-5.3` | `read`, `write`, `edit`, `bash`, `web_search`, `web_fetch` + spawning | General implementer; may spawn `scout` and `researcher` |
+| **scout** | `vllm/qwen3.8-27b` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
+| **researcher** | `vllm/qwen3.8-27b` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
+| **worker** | `vllm/qwen3.8-27b` | `read`, `write`, `edit`, `bash` + spawning | General implementer; may spawn `scout` and `reviewer` |
+| **reviewer** | `vllm/qwen3.8-27b` | `read`, `grep`, `find`, `ls`, `bash` (read-only) | Code review: diff/changed files → structured findings (Critical / Warnings / Suggestions) |
 
-All three are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`).
+All four are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`). The `reviewer` is the natural middle step of a `worker → reviewer → worker` [chain](#chains).
+
+### Bundled web tools
+
+`web_search` and `web_fetch` ship inside the package (`pi-extension/subagents/tools/`) — no separate install needed; the researcher gets them from its `tools:` list out of the box.
+
+- **`web_search`** — web search via a [SearXNG](https://docs.searxng.org/) JSON API. The instance URL comes from the **`SEARXNG_URL`** env var (default `http://host.docker.internal:8088`, the docker-bridge route to a SearXNG running on the host). SearXNG's JSON format must be enabled in its `settings.yml` (`search.formats: [html, json]`). Returns a numbered title/URL/snippet list; the query supports SearXNG operators (`"exact phrase"`, `OR`, `inurl:`, `intitle:`, `filetype:`). **Rate-limited to one request per 61s** — SearXNG's upstream engines suspend the instance on query bursts, so the tool paces itself. The limit is **cross-process** (a small state file under the system temp dir, keyed by SearXNG URL, serialized with an `O_EXCL` lock), so parallel sub-agents can't burst the engine pool together; a call may wait before running, and waits are reported. Tune with **`WEB_SEARCH_MIN_INTERVAL_S`** (seconds, `0` disables). Because the upstream engines rate-limit aggressively, the tool also surfaces `unresponsive_engines` in the response, so a model can tell "nothing exists" from "engines are down — retry in a minute".
+- **`web_fetch`** — fetches a URL and returns readable content as markdown: Readability + Turndown for HTML, unpdf text extraction for PDFs (max 100 pages), plain text passthrough, and Next.js RSC flight-data extraction. **Local-only**: the original implementation's Jina Reader fallback was removed — pages that can't be extracted produce an explanatory error (e.g. "page appears to be JavaScript-rendered") instead of phoning out to an external service. Limits: 5 MB (20 MB PDF), 30 s timeout.
+
+The `web_fetch` tool has its own `package.json` (readability, linkedom, turndown, unpdf) in `tools/web-fetch/` — run `npm ci` there once (the Dockerfile does it at build time). `web_search` has no npm dependencies.
 
 ## Custom agents
 
@@ -90,7 +125,7 @@ Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global).
 ---
 name: my-agent
 description: Does something specific
-model: openrouter/z-ai/glm-5.3
+model: vllm/qwen3.8-27b
 thinking: medium
 tools: read, edit, write, safe_bash, web_search
 session-mode: lineage-only

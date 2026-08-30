@@ -24,6 +24,7 @@ import {
   closeSurface,
   shellEscape,
   readScreen,
+  isSurfaceAlive,
 } from "./tmux.ts";
 
 import {
@@ -92,17 +93,27 @@ function getModuleAbortSignal(): AbortSignal {
 }
 
 const SubagentParams = Type.Object({
-  agent: Type.String({
-    description:
-      "Which agent to spawn (e.g. 'worker', 'scout', 'researcher'). This loads the agent's " +
-      "fixed profile — its model, tool loadout, and system prompt. Must be one of the available agents.",
-  }),
-  task: Type.String({ description: "Task/prompt for the sub-agent" }),
+  agent: Type.Optional(
+    Type.String({
+      description:
+        "Which agent to spawn (e.g. 'worker', 'scout', 'researcher'). This loads the agent's " +
+        "fixed profile — its model, tool loadout, and system prompt. Must be one of the available agents. " +
+        "Required in single mode; omit it when using `chain`.",
+    }),
+  ),
+  task: Type.Optional(
+    Type.String({
+      description:
+        "Task/prompt for the sub-agent. Required in single mode; omit it when using `chain`. " +
+        "In chain mode each step has its own task, and the previous step's output is appended to it automatically.",
+    }),
+  ),
   name: Type.Optional(
     Type.String({
       description:
         "Optional cosmetic label for the subagent's pane and widget row. Defaults to the agent name. " +
-        "Has no effect on which agent runs — use `agent` for that.",
+        "Has no effect on which agent runs — use `agent` for that. In chain mode this names the chain " +
+        "(its steps get their own names).",
     }),
   ),
   model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
@@ -111,6 +122,38 @@ const SubagentParams = Type.Object({
       description:
         "Working directory for the sub-agent. The agent starts in this folder and picks up its local .pi/ config, CLAUDE.md, skills, and extensions. Use for role-specific subfolders.",
     }),
+  ),
+  chain: Type.Optional(
+    Type.Array(
+      Type.Object({
+        agent: Type.String({
+          description: "Which agent to spawn for this step (e.g. 'worker', 'reviewer', 'scout').",
+        }),
+        task: Type.String({
+          description:
+            "Task for this step. The previous step's final output is APPENDED to it automatically — " +
+            "do not include any {previous} placeholder or paste prior output yourself.",
+        }),
+        name: Type.Optional(
+          Type.String({
+            description:
+              "Optional cosmetic label for this step's pane. Defaults to the agent name (auto-suffixed on collision).",
+          }),
+        ),
+        model: Type.Optional(Type.String({ description: "Model override for this step (overrides agent default)" })),
+        cwd: Type.Optional(
+          Type.String({ description: "Working directory for this step's agent process" }),
+        ),
+      }),
+      {
+        description:
+          "Run a sequence of subagents one after another (a chain), e.g. worker → reviewer → worker. " +
+          "Each step's final output is automatically appended to the next step's task, so follow-up steps " +
+          "always receive the prior step's report/summary. Use this INSTEAD of agent+task. " +
+          "The chain runs in the background; the aggregate result for the whole chain is delivered as a " +
+          "steer message when the last step finishes (or the chain stops early on a failed step).",
+      },
+    ),
   ),
 });
 
@@ -217,8 +260,8 @@ function getToolExtensionPath(tool: string): string | undefined {
   }
   const extBase = join(getAgentConfigDir(), "extensions");
   const map: Record<string, string> = {
-    web_search: join(extBase, "web-search", "index.ts"),
-    web_fetch: join(extBase, "web-fetch", "index.ts"),
+    web_search: join(SUBAGENTS_DIR, "tools", "web-search", "index.ts"),
+    web_fetch: join(SUBAGENTS_DIR, "tools", "web-fetch", "index.ts"),
     video_extract: join(extBase, "video-extract", "index.ts"),
     youtube_search: join(extBase, "youtube-search", "index.ts"),
     google_image_search: join(extBase, "google-image-search", "index.ts"),
@@ -639,6 +682,509 @@ const runningSubagents = new Map<string, RunningSubagent>();
 // modules share. (subagent-done.ts reads it; if absent it assumes zero.)
 const RUNNING_CHILDREN_COUNT_KEY = Symbol.for("pi-subagents/running-children-count");
 (globalThis as any)[RUNNING_CHILDREN_COUNT_KEY] = () => runningSubagents.size;
+
+// ── Chains ──────────────────────────────────────────────────────────────────
+// `chain` mode of the subagent tool: run subagents one after another
+// (e.g. worker → reviewer → worker) and automatically append each step's
+// final output to the next step's task. The hand-off is driven by this
+// extension, not by the model, so the previous step's output can never be
+// forgotten (no `{previous}` placeholder for the caller to add on its own).
+//
+// Like every other subagent operation here, a chain is fire-and-forget from
+// the tool call's point of view: `subagent({ chain: [...] })` returns an
+// immediate acknowledgement, the steps run sequentially in the background
+// (each in its own pane, tracked by the widget), and ONE aggregate result
+// for the whole chain is delivered as a steer message when the last step
+// finishes — or when the chain stops early because a step failed.
+
+const MAX_CHAIN_STEPS = 10;
+/** Cap (chars) for non-final step outputs in the final steer content. */
+const CHAIN_STEP_OUTPUT_CAP = 16_000;
+
+type ChainStepStatus = "pending" | "running" | "completed" | "failed" | "cancelled" | "skipped";
+
+interface ChainStepRecord {
+  index: number;
+  agent: string;
+  /** The original (un-appended) task requested for this step. */
+  task: string;
+  /** Running subagent name; defaulted to the agent name at launch. */
+  name?: string;
+  model?: string;
+  cwd?: string;
+  status: ChainStepStatus;
+  exitCode?: number;
+  elapsed?: number;
+  /** This step's final assistant message — the text handed to the next step. */
+  output?: string;
+  summary?: string;
+  errorMessage?: string;
+  sessionFile?: string;
+  sessionId?: string;
+}
+
+interface ActiveChain {
+  name: string;
+  steps: ChainStepRecord[];
+  /** 1-based index of the currently running step; 0 when between steps. */
+  currentStep: number;
+  currentRunning: RunningSubagent | null;
+  startTime: number;
+  finished: boolean;
+  finishedAt?: number;
+  /** True when aborted because the parent session shut down. */
+  aborted: boolean;
+  /** True when a step's pane was closed from outside. */
+  surfaceLost: boolean;
+  abortController: AbortController;
+}
+
+/**
+ * Build the task for a chain step: the requested task plus, for every step
+ * after the first, the previous step's final output, APPENDED. The append is
+ * automatic — the caller never has to (and should not try to) embed a
+ * `{previous}` placeholder itself.
+ */
+export function buildChainStepTask(
+  task: string,
+  previous: { agent: string; stepIndex: number; output: string } | null,
+): string {
+  if (!previous || !previous.output.trim()) return task;
+  return (
+    `${task}\n\n` +
+    `## Output from previous step (step ${previous.stepIndex}: ${previous.agent})\n\n` +
+    previous.output
+  );
+}
+
+function truncateChainOutput(text: string, cap: number): string {
+  if (text.length <= cap) return text;
+  const omitted = text.length - cap;
+  return `${text.slice(0, cap)}\n\n[truncated — ${omitted} more characters; full output in the step's session file]`;
+}
+
+/** The `details.steps` payload shared by the steer message and the renderer. */
+function chainStepDetails(steps: ChainStepRecord[]): Array<Record<string, unknown>> {
+  return steps.map((s) => ({
+    index: s.index,
+    agent: s.agent,
+    ...(s.name ? { name: s.name } : {}),
+    status: s.status,
+    ...(s.exitCode !== undefined ? { exitCode: s.exitCode } : {}),
+    ...(s.elapsed !== undefined ? { elapsed: s.elapsed } : {}),
+    ...(s.output ? { output: s.output } : {}),
+    ...(s.summary ? { summary: s.summary } : {}),
+    ...(s.errorMessage ? { errorMessage: s.errorMessage } : {}),
+    ...(s.sessionFile ? { sessionFile: s.sessionFile } : {}),
+  }));
+}
+
+/** Plain-text presentation of a finished chain — what the model reads. */
+function formatChainPresentation(chain: ActiveChain): string {
+  const totalSeconds = Math.max(0, Math.floor(((chain.finishedAt ?? Date.now()) - chain.startTime) / 1000));
+  const total = chain.steps.length;
+  const completed = chain.steps.filter((s) => s.status === "completed").length;
+  const failedStep = chain.steps.find((s) => s.status === "failed");
+
+  let head: string;
+  if (chain.aborted) {
+    head = `Chain "${chain.name}" was cancelled (parent session shut down). ${completed}/${total} steps completed.`;
+  } else if (failedStep) {
+    const reason = chain.surfaceLost
+      ? "the step's pane was closed"
+      : failedStep.errorMessage
+        ? `provider/agent error: ${failedStep.errorMessage}`
+        : `exit code ${failedStep.exitCode ?? "?"}`;
+    head =
+      `Chain "${chain.name}" stopped at step ${failedStep.index}/${total} (${failedStep.agent}) — ${reason}. ` +
+      `${completed}/${total} steps completed in ${formatElapsed(totalSeconds)}; remaining steps were not run.`;
+  } else {
+    head = `Chain "${chain.name}" completed: ${completed}/${total} steps in ${formatElapsed(totalSeconds)}.`;
+  }
+
+  const ranSteps = chain.steps.filter((s) => s.status === "completed" || s.status === "failed" || s.status === "cancelled");
+  const sections = ranSteps.map((s, i) => {
+    const isLast = i === ranSteps.length - 1;
+    const statusLine =
+      s.status === "completed"
+        ? `completed in ${formatElapsed(s.elapsed ?? 0)}`
+        : s.status === "failed"
+          ? `FAILED${s.errorMessage ? " (provider/agent error)" : ` (exit ${s.exitCode ?? "?"})`}`
+          : "cancelled";
+    const body = (s.output ?? s.summary ?? s.errorMessage ?? "(no output)").trim();
+    const text = isLast ? body : truncateChainOutput(body, CHAIN_STEP_OUTPUT_CAP);
+    return `## Step ${s.index}/${total}: ${s.agent}${s.name ? ` (${s.name})` : ""} — ${statusLine}\n\n${text}`;
+  });
+
+  const skipped = chain.steps.filter((s) => s.status === "skipped").map((s) => s.agent);
+  const tail: string[] = [];
+  if (skipped.length > 0) tail.push(`Not run (chain stopped early): ${skipped.join(", ")}.`);
+  const stepNames = chain.steps
+    .filter((s) => s.name && s.sessionFile)
+    .map((s) => `subagent_message({ name: "${s.name}", message: "…" })`);
+  if (stepNames.length > 0) tail.push(`Follow up on any step with ${stepNames.join(" or ")}.`);
+
+  return [head, ...sections].join("\n\n---\n\n").concat(tail.length ? `\n\n${tail.join("\n")}` : "");
+}
+
+interface ChainStepRunResult {
+  name: string;
+  sessionFile?: string;
+  sessionId?: string;
+  summary: string;
+  exitCode: number;
+  elapsed: number;
+  errorMessage?: string;
+}
+
+type ChainStepRunner = (
+  step: { agent: string; task: string; name: string; model?: string; cwd?: string },
+  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  parentArtifactDir: string,
+  pi: ExtensionAPI,
+  signal: AbortSignal,
+  hooks: {
+    onLaunched: (running: RunningSubagent) => void;
+    onSurfaceLost: () => void;
+  },
+) => Promise<ChainStepRunResult>;
+
+/**
+ * Per-step runner for chains: launch a pane, register the name, watch until
+ * the step exits. Isolated behind a hook so unit tests can replace it
+ * (spawning real tmux panes is integration-test territory).
+ */
+const chainHooks: { runStep: ChainStepRunner } = {
+  runStep: async (step, ctx, parentArtifactDir, _pi, signal, { onLaunched, onSurfaceLost }) => {
+    const running = await launchSubagent(
+      {
+        agent: step.agent,
+        task: step.task,
+        name: step.name,
+        ...(step.model ? { model: step.model } : {}),
+        ...(step.cwd ? { cwd: step.cwd } : {}),
+      },
+      ctx,
+    );
+    onLaunched(running);
+    registerName(parentArtifactDir, running.name, {
+      sessionFile: running.sessionFile,
+      sessionId: getSessionId(running.sessionFile),
+    });
+    const result = await watchSubagent(running, signal, {
+      onTick: () => {
+        if (!isSurfaceAlive(running.surface)) onSurfaceLost();
+      },
+    });
+    updateWidget();
+    return {
+      name: running.name,
+      ...(result.sessionFile ? { sessionFile: result.sessionFile } : {}),
+      ...(result.sessionId ? { sessionId: result.sessionId } : {}),
+      summary: result.summary,
+      exitCode: result.exitCode,
+      elapsed: result.elapsed,
+      ...(result.errorMessage ? { errorMessage: result.errorMessage } : {}),
+    };
+  },
+};
+
+/**
+ * Drive a chain to completion, one step after another.
+ *
+ * Each step's final output is appended to the next step's task via
+ * buildChainStepTask(). When a step fails (non-zero exit, provider error,
+ * lost pane, or abort) the chain stops and the aggregate result — including
+ * everything completed so far — is delivered as a single steer message.
+ */
+async function runChain(
+  chain: ActiveChain,
+  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  parentArtifactDir: string,
+  pi: ExtensionAPI,
+): Promise<void> {
+  let previous: { agent: string; stepIndex: number; output: string } | null = null;
+
+  for (const step of chain.steps) {
+    if (chain.aborted || chain.abortController.signal.aborted) {
+      step.status = "skipped";
+      continue;
+    }
+
+    step.status = "running";
+    chain.currentStep = step.index;
+
+    // Default the step's name to the agent name, uniquified against running
+    // subagents, in-flight reservations, and the session's persistent
+    // registry (earlier chain steps live there). Reserve it synchronously
+    // (before any await) so parallel spawns can't collide.
+    if (!step.name) {
+      const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
+      step.name = uniqueRunningName(step.agent, registryNames);
+      reservedNames.add(step.name);
+    }
+
+    try {
+      const taskForStep = buildChainStepTask(step.task, previous);
+      const result = await chainHooks.runStep(
+        {
+          agent: step.agent,
+          task: taskForStep,
+          name: step.name,
+          ...(step.model ? { model: step.model } : {}),
+          ...(step.cwd ? { cwd: step.cwd } : {}),
+        },
+        ctx,
+        parentArtifactDir,
+        pi,
+        chain.abortController.signal,
+        {
+          onLaunched: (running) => {
+            chain.currentRunning = running;
+          },
+          onSurfaceLost: () => {
+            chain.surfaceLost = true;
+            chain.abortController.abort();
+          },
+        },
+      );
+
+      step.name = result.name;
+      step.sessionFile = result.sessionFile;
+      step.sessionId = result.sessionId;
+      step.exitCode = result.exitCode;
+      step.elapsed = result.elapsed;
+      step.summary = result.summary;
+      if (chain.abortController.signal.aborted) {
+        step.status = chain.aborted ? "cancelled" : "failed";
+        if (result.errorMessage) step.errorMessage = result.errorMessage;
+      } else if (result.exitCode !== 0 || result.errorMessage) {
+        step.status = "failed";
+        if (result.errorMessage) step.errorMessage = result.errorMessage;
+      } else {
+        step.status = "completed";
+        step.output = result.summary;
+        previous = { agent: step.agent, stepIndex: step.index, output: result.summary };
+      }
+    } catch (err) {
+      step.status = "failed";
+      step.errorMessage = err?.message ?? String(err);
+    } finally {
+      if (step.name) reservedNames.delete(step.name);
+    }
+
+    if (step.status !== "completed") {
+      // The chain stopped: mark the remaining steps so the presentation and
+      // the renderer can show exactly what never ran.
+      for (const rest of chain.steps.slice(chain.steps.indexOf(step) + 1)) {
+        if (rest.status === "pending") rest.status = "skipped";
+      }
+      break;
+    }
+  }
+
+  chain.currentStep = 0;
+  chain.currentRunning = null;
+  chain.finished = true;
+  chain.finishedAt = Date.now();
+
+  const allCompleted = chain.steps.every((s) => s.status === "completed");
+  try {
+    pi.sendMessage(
+      {
+        customType: "subagent_result",
+        content: formatChainPresentation(chain),
+        display: true,
+        details: {
+          name: chain.name,
+          chain: true,
+          exitCode: allCompleted ? 0 : 1,
+          elapsed: Math.max(0, Math.floor((chain.finishedAt - chain.startTime) / 1000)),
+          ...(chain.aborted ? { cancelled: true } : {}),
+          ...(chain.surfaceLost ? { surfaceLost: true } : {}),
+          steps: chainStepDetails(chain.steps),
+        },
+      },
+      { triggerTurn: true, deliverAs: "steer" },
+    );
+  } catch {
+    // The session may already be gone (shutdown mid-chain); nothing to do.
+  }
+}
+
+/**
+ * Validate a `chain` spawn and kick it off. Returns the tool result: either
+ * a validation error (nothing launched) or an acknowledgement (the chain
+ * runs in the background and reports via a steer message).
+ */
+function startChain(
+  params: { chain?: Array<{ agent?: string; task?: string; name?: string; model?: string; cwd?: string }>; name?: string },
+  permittedSet: Set<string>,
+  permittedList: string,
+  currentAgent: string | undefined,
+  ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
+  pi: ExtensionAPI,
+): { content: Array<{ type: "text"; text: string }>; details: Record<string, unknown> } {
+  const chainSteps = params.chain ?? [];
+
+  if (chainSteps.length > MAX_CHAIN_STEPS) {
+    return {
+      content: [{ type: "text", text: `Too many chain steps (${chainSteps.length}). Max is ${MAX_CHAIN_STEPS}.` }],
+      details: { error: "chain too long" },
+    };
+  }
+
+  // Validate every step up front so a bad step never leaves a partial chain running.
+  for (let i = 0; i < chainSteps.length; i++) {
+    const step = chainSteps[i];
+    if (!step?.agent || !String(step.agent).trim()) {
+      return {
+        content: [{ type: "text", text: `Chain step ${i + 1} is missing an agent.` }],
+        details: { error: "chain step missing agent", step: i + 1 },
+      };
+    }
+    if (!step?.task || !String(step.task).trim()) {
+      return {
+        content: [{ type: "text", text: `Chain step ${i + 1} is missing a task.` }],
+        details: { error: "chain step missing task", step: i + 1 },
+      };
+    }
+    if (!permittedSet.has(step.agent)) {
+      return {
+        content: [
+          {
+            type: "text",
+            text:
+              `Chain step ${i + 1} may not spawn the "${step.agent}" agent — it is not ` +
+              `${SUBAGENT_ALLOWLIST ? "in your allowlist" : "a known agent"}. Available agents: ${permittedList}.`,
+          },
+        ],
+        details: { error: SUBAGENT_ALLOWLIST ? "chain agent not in allowlist" : "unknown chain agent", step: i + 1 },
+      };
+    }
+    if (currentAgent && step.agent === currentAgent) {
+      return {
+        content: [
+          {
+            type: "text",
+            text: `You are the ${currentAgent} agent — a chain cannot include another ${currentAgent}. You were spawned to do that work yourself.`,
+          },
+        ],
+        details: { error: "self-spawn blocked", step: i + 1 },
+      };
+    }
+  }
+
+  if (!isMuxAvailable()) {
+    return {
+      content: [{ type: "text", text: `Subagents require tmux. ${muxSetupHint()}` }],
+      details: { error: "tmux not available" },
+    };
+  }
+
+  if (!ctx.sessionManager.getSessionFile()) {
+    return {
+      content: [{ type: "text", text: "Error: no session file. Start pi with a persistent session to use subagents." }],
+      details: { error: "no session file" },
+    };
+  }
+
+  // This spawner session's artifact dir hosts the name registry; chain steps
+  // are registered there like ordinary spawns so subagent_message can address them.
+  const parentArtifactDir = getArtifactDir(
+    ctx.sessionManager.getSessionDir(),
+    ctx.sessionManager.getSessionId(),
+  );
+  const sessionChains = getChainMapForSession(ctx.sessionManager.getSessionId());
+  const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
+  const baseName = params.name?.trim() || uniqueRunningName("chain", registryNames);
+  let chainName = baseName;
+  let suffix = 2;
+  while (sessionChains.has(chainName)) chainName = `${baseName}-${suffix++}`;
+
+  const chain: ActiveChain = {
+    name: chainName,
+    steps: chainSteps.map((s, i) => ({
+      index: i + 1,
+      agent: s.agent as string,
+      task: s.task as string,
+      ...(s.name?.trim() ? { name: s.name.trim() } : {}),
+      ...(s.model ? { model: s.model } : {}),
+      ...(s.cwd ? { cwd: s.cwd } : {}),
+      status: "pending" as const,
+    })),
+    currentStep: 0,
+    currentRunning: null,
+    startTime: Date.now(),
+    finished: false,
+    aborted: false,
+    surfaceLost: false,
+    abortController: new AbortController(),
+  };
+  sessionChains.set(chain.name, chain);
+
+  startWidgetRefresh();
+  startStatusRefresh(pi);
+
+  // Fire-and-forget: the chain drives itself and reports via a steer message.
+  runChain(chain, ctx, parentArtifactDir, pi).catch((err) => {
+    // runChain handles step failures internally; this is a last resort.
+    if (!chain.finished) {
+      chain.finished = true;
+      chain.finishedAt = Date.now();
+    }
+    try {
+      pi.sendMessage(
+        {
+          customType: "subagent_result",
+          content: `Chain "${chain.name}" error: ${err?.message ?? String(err)}`,
+          display: true,
+          details: {
+            name: chain.name,
+            chain: true,
+            exitCode: 1,
+            steps: chainStepDetails(chain.steps),
+          },
+        },
+        { triggerTurn: true, deliverAs: "steer" },
+      );
+    } catch {
+      /* session may be gone */
+    }
+  });
+
+  return {
+    content: [
+      {
+        type: "text",
+        text:
+          `Chain "${chain.name}" started: ${chain.steps.length} steps (${chain.steps.map((s) => s.agent).join(" → ")}). ` +
+          `It runs in the background, one step after another — each step's final output is automatically appended to the next step's task ` +
+          `(no {previous} placeholder needed). Do NOT poll, sleep, or try to track it manually. ` +
+          `The aggregate result for the whole chain arrives as a steer message when the last step finishes, ` +
+          `or when the chain stops early because a step failed. ` +
+          `To reach the currently running step: subagent_message({ name: "${chain.name}", message: "…" }) or the step's own name.`,
+      },
+    ],
+    details: {
+      status: "chain-started",
+      chainName: chain.name,
+      steps: chain.steps.map((s) => ({ index: s.index, agent: s.agent })),
+    },
+  };
+}
+
+/** Active chains, keyed by spawner session id, then chain name. */
+const chainsBySession = new Map<string, Map<string, ActiveChain>>();
+
+function getChainMapForSession(sessionId: string): Map<string, ActiveChain> {
+  let m = chainsBySession.get(sessionId);
+  if (!m) {
+    m = new Map();
+    chainsBySession.set(sessionId, m);
+  }
+  return m;
+}
 
 // ── Widget management ──
 
@@ -1148,6 +1694,29 @@ export const __test__ = {
   contextWindowFor,
   formatUsageSegments,
   widgetIcon,
+  // Chain internals (unit-test hooks)
+  buildChainStepTask,
+  chainHooks,
+  formatChainPresentation,
+  truncateChainOutput,
+  startChain,
+  runChain,
+  getChainMapForSession,
+  chainsBySession,
+  MAX_CHAIN_STEPS,
+  /** Test hook: stop the widget/status refresh timers (they keep the test process alive). */
+  stopTimersForTest() {
+    if (widgetInterval) {
+      clearInterval(widgetInterval);
+      widgetInterval = null;
+      (globalThis as any)[WIDGET_INTERVAL_KEY] = null;
+    }
+    if (statusInterval) {
+      clearInterval(statusInterval);
+      statusInterval = null;
+      (globalThis as any)[STATUS_INTERVAL_KEY] = null;
+    }
+  },
 };
 
 function startWidgetRefresh() {
@@ -1524,6 +2093,7 @@ function deliverPendingQuestion(running: RunningSubagent): void {
 async function watchSubagent(
   running: RunningSubagent,
   signal: AbortSignal,
+  options?: { onTick?: () => void },
 ): Promise<SubagentResult> {
   const { name, task, surface, startTime, sessionFile } = running;
 
@@ -1535,6 +2105,7 @@ async function watchSubagent(
       onTick() {
         observeRunningSubagent(running);
         deliverPendingQuestion(running);
+        options?.onTick?.();
       },
     });
 
@@ -1673,6 +2244,17 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       agent.abortController?.abort();
     }
     runningSubagents.clear();
+    // Chains belong to this session's process too — abort any that are still
+    // running so their watchers stop (the aggregate steer, if it can still be
+    // delivered, reports the cancellation).
+    for (const sessionChains of chainsBySession.values()) {
+      for (const chain of sessionChains.values()) {
+        if (!chain.finished) {
+          chain.aborted = true;
+          chain.abortController.abort();
+        }
+      }
+    }
   });
 
   // The spawning tools are always registered here. Whether a child process can
@@ -1690,19 +2272,63 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready. " +
+        "Chains: instead of agent+task, pass chain: [{agent, task}, ...] to run subagents one after another " +
+        "(e.g. worker → reviewer → worker). Each step's final output is automatically appended to the next step's task — " +
+        "you never need a {previous} placeholder or to paste prior output yourself. " +
+        "The chain runs in the background and the aggregate result for the whole chain is delivered as a steer message " +
+        "when the last step finishes, or when the chain stops early because a step failed. " +
+        "To reach the currently running step, use subagent_message with the chain name or the step's own name.",
       promptSnippet:
         "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
         "When the sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up and starts a new turn — you do not need to do anything to receive it. " +
         "DO NOT write polling loops, sleep/wait commands, tail/watch scripts, or repeatedly read session/log files to detect completion. DO NOT call subagents_list or any other tool to 'check' status. All of that is wasted work — the harness handles delivery for you. " +
         "DO NOT fabricate, assume, or summarize results after calling this tool. " +
-        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready.",
+        "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready. " +
+        "Chains: pass chain: [{agent, task}, ...] instead of agent+task to run subagents one after another — " +
+        "each step's final output is automatically appended to the next step's task (no {previous} placeholder needed). " +
+        "The aggregate chain result arrives as a steer message when the chain finishes.",
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
-        // Prevent self-spawning (e.g. planner spawning another planner)
+        const hasChain = Array.isArray(params.chain) && params.chain.length > 0;
+        const hasSingle = Boolean(params.agent || params.task);
+
+        if (hasChain && hasSingle) {
+          return {
+            content: [
+              {
+                type: "text",
+                text:
+                  "Provide either a single spawn (agent + task) or a chain (chain array of steps) — not both. " +
+                  "For sequential worker → reviewer → worker style workflows use chain with one {agent, task} entry per step.",
+              },
+            ],
+            details: { error: "chain and single spawn are mutually exclusive" },
+          };
+        }
+
+        // Strict whitelist at every depth. The caller's permitted set is:
+        //   • a restricted subagent (PI_SUBAGENT_ALLOWED) → only its pinned agents;
+        //   • a top-level session → every discoverable agent, i.e. exactly what
+        //     `subagents_list` shows.
+        // Every spawn must name an agent in that set. Without this guard a missing or
+        // unknown `agent` silently launches an unrestricted, full-toolset child.
         const currentAgent = process.env.PI_SUBAGENT_AGENT;
+        const permittedAgents = SUBAGENT_ALLOWLIST
+          ? [...SUBAGENT_ALLOWLIST]
+          : discoverAgentDefinitions().map((a) => a.name);
+        const permittedSet = new Set(permittedAgents);
+        const permittedList = permittedAgents.join(", ") || "(none)";
+
+        // ── Chain mode: validate + kick off, then return an acknowledgement ──
+        if (hasChain) {
+          return startChain(params, permittedSet, permittedList, currentAgent, ctx, pi);
+        }
+
+        // ── Single-spawn mode ──
+        // Prevent self-spawning (e.g. planner spawning another planner)
         if (params.agent && currentAgent && params.agent === currentAgent) {
           return {
             content: [
@@ -1715,31 +2341,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           };
         }
 
-        // Strict whitelist at every depth. The caller's permitted set is:
-        //   • a restricted subagent (PI_SUBAGENT_ALLOWED) → only its pinned agents;
-        //   • a top-level session → every discoverable agent, i.e. exactly what
-        //     `subagents_list` shows.
-        // Every spawn must name an agent in that set. The lone exception is a
-        // top-level `fork: true` clone, which has no role and inherits the
-        // caller's own already-trusted toolset. Without this guard a missing or
-        // unknown `agent` silently launches an unrestricted, full-toolset child.
-        const permittedAgents = SUBAGENT_ALLOWLIST
-          ? [...SUBAGENT_ALLOWLIST]
-          : discoverAgentDefinitions().map((a) => a.name);
-        const permittedSet = new Set(permittedAgents);
-        const permittedList = permittedAgents.join(", ") || "(none)";
-
-        if (!params.agent) {
+        if (!params.agent || !params.task) {
           return {
             content: [
               {
                 type: "text",
                 text:
-                  `You must specify which agent to spawn via the "agent" field. ` +
+                  `You must specify which agent to spawn via the "agent" field (with a "task"), ` +
+                  `or provide a "chain" array of {agent, task} steps for a sequential chain. ` +
                   `Available agents: ${permittedList}.`,
               },
             ],
-            details: { error: "agent required" },
+            details: { error: "agent+task or chain required" },
           };
         } else if (!permittedSet.has(params.agent)) {
           return {
@@ -1890,6 +2503,34 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
       renderCall(args, theme) {
         const partialArgs = args as Record<string, unknown>;
+
+        // Chain mode: show the step sequence.
+        const chain = Array.isArray(partialArgs.chain) ? (partialArgs.chain as any[]) : null;
+        if (chain && chain.length > 0) {
+          const chainName =
+            typeof partialArgs.name === "string" && partialArgs.name ? partialArgs.name : "chain";
+          let text =
+            "○ " +
+            theme.fg("toolTitle", theme.bold(chainName)) +
+            theme.fg("accent", ` — chain (${chain.length} steps)`);
+          chain.slice(0, 5).forEach((s, i) => {
+            const agent = s && typeof s.agent === "string" ? s.agent : "...";
+            const task = s && typeof s.task === "string" ? s.task : "";
+            // renderCall is called repeatedly as the LLM generates arguments,
+            // so the task grows token by token — keep it to one short line.
+            const firstLine = task.split("\n").find((l: string) => l.trim()) ?? "";
+            const preview = firstLine.length > 60 ? firstLine.slice(0, 60) + "…" : firstLine;
+            text +=
+              "\n  " +
+              theme.fg("muted", `${i + 1}.`) +
+              " " +
+              theme.fg("accent", agent) +
+              (preview ? theme.fg("dim", ` ${preview}`) : "");
+          });
+          if (chain.length > 5) text += `\n  ${theme.fg("muted", `... +${chain.length - 5} more`)}`;
+          return new Text(text, 0, 0);
+        }
+
         const agentName =
           typeof partialArgs.agent === "string" && partialArgs.agent ? partialArgs.agent : "";
         const name =
@@ -1938,6 +2579,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               " " +
               theme.fg("toolTitle", theme.bold(name)) +
               theme.fg("dim", " — started"),
+            0,
+            0,
+          );
+        }
+
+        // "Chain started" result — tool returned immediately; the chain runs
+        // in the background and reports via a steer message when it finishes.
+        if (details?.status === "chain-started") {
+          const chainName = details.chainName ?? "chain";
+          const steps: any[] = details.steps ?? [];
+          const stepList = steps.map((s) => s.agent).join(" → ");
+          return new Text(
+            theme.fg("accent", "⟳") +
+              " " +
+              theme.fg("toolTitle", theme.bold(chainName)) +
+              theme.fg("dim", ` — chain started (${steps.length} steps: ${stepList})`) +
+              theme.fg("muted", " · result arrives as a steer message"),
             0,
             0,
           );
@@ -2087,6 +2745,41 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const runningMatch = Array.from(runningSubagents.values()).find((r) => r.name === requestedName);
         if (runningMatch) {
           return handleSubagentSteer({ name: requestedName, message: params.message });
+        }
+
+        // ── Message an active chain ──
+        // A chain is not a running subagent itself — its steps are. A name
+        // that matches an active chain is delivered to the chain's currently
+        // running step, so the orchestrator can steer a chain by one handle.
+        const chain = getChainMapForSession(ctx.sessionManager.getSessionId()).get(requestedName);
+        if (chain) {
+          if (chain.finished) {
+            const stepNames = chain.steps.map((s) => s.name).filter(Boolean).join(", ") || "(none recorded)";
+            const err =
+              `Chain "${requestedName}" has already finished — its aggregate result was delivered as a steer message. ` +
+              `To continue working with one of its sessions, message a step by name: ${stepNames}.`;
+            return { content: [{ type: "text" as const, text: err }], details: { error: "chain finished" } };
+          }
+          const current = chain.currentRunning;
+          if (!current) {
+            const err =
+              `Chain "${requestedName}" is between steps right now; the aggregate result steer will arrive shortly. ` +
+              `Try again in a moment, or wait for it.`;
+            return { content: [{ type: "text" as const, text: err }], details: { error: "chain between steps" } };
+          }
+          const steer = handleSubagentSteer({ name: current.name, message: params.message });
+          if (steer.details?.error) return steer;
+          return {
+            content: [
+              {
+                type: "text" as const,
+                text:
+                  `Message delivered to chain "${requestedName}" (step ${chain.currentStep}/${chain.steps.length}: ${current.name}). ` +
+                  `It picks this up at its next turn boundary. The chain's aggregate result still arrives as a steer message when the chain finishes.`,
+              },
+            ],
+            details: { ...steer.details, chain: requestedName },
+          };
         }
 
         // ── Resume a finished session by name ──
@@ -2353,6 +3046,98 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   pi.registerMessageRenderer("subagent_result", (message, options, theme) => {
     const details = message.details as any;
     if (!details) return undefined;
+
+    // Chain aggregate result: one box listing every step of the chain.
+    if (details.chain && Array.isArray(details.steps)) {
+      const steps: any[] = details.steps;
+      const name = details.name ?? "chain";
+      const failed = (details.exitCode ?? 0) !== 0;
+      const elapsed = details.elapsed != null ? formatElapsed(details.elapsed) : "?";
+      const completedCount = steps.filter((s) => s.status === "completed").length;
+      const bgFn = failed
+        ? (text: string) => theme.bg("toolErrorBg", text)
+        : (text: string) => theme.bg("toolSuccessBg", text);
+      const icon = failed ? theme.fg("error", "✗") : theme.fg("success", "✓");
+
+      return {
+        render(width: number): string[] {
+          const stepStatusText = (s: any): string =>
+            s.status === "completed"
+              ? s.elapsed != null ? formatElapsed(s.elapsed) : "done"
+              : s.status === "failed"
+                ? "failed"
+                : s.status === "cancelled"
+                  ? "cancelled"
+                  : s.status === "skipped"
+                    ? "skipped"
+                    : "pending";
+
+          const contentLines: string[] = [
+            `${icon} ${theme.fg("toolTitle", theme.bold(name))} ` +
+              theme.fg("accent", `chain ${completedCount}/${steps.length}`) +
+              ` ${theme.fg("dim", "—")} ${theme.fg("dim", elapsed)}`,
+            ...steps.map((s, i: number) => {
+              const sIcon =
+                s.status === "completed"
+                  ? theme.fg("success", "✓")
+                  : s.status === "failed"
+                    ? theme.fg("error", "✗")
+                    : theme.fg("muted", "○");
+              return `${theme.fg("muted", `${i + 1}.`)} ${theme.fg("toolTitle", theme.bold(s.name ?? s.agent))}` +
+                theme.fg("dim", ` (${s.agent})`) +
+                ` ${sIcon} ${theme.fg("dim", stepStatusText(s))}`;
+            }),
+          ];
+
+          if (options.expanded) {
+            for (const s of steps) {
+              if (s.status !== "completed" && s.status !== "failed") continue;
+              contentLines.push("");
+              contentLines.push(
+                theme.fg(
+                  "muted",
+                  `─── Step ${s.index}: ${s.agent}${s.errorMessage ? ` — ${s.errorMessage}` : ""}`,
+                ),
+              );
+              const out = String(s.output ?? s.summary ?? "").split("\n");
+              for (const line of out.slice(0, 30)) {
+                contentLines.push(line.slice(0, width - 6));
+              }
+              if (out.length > 30) {
+                contentLines.push(theme.fg("muted", `… ${out.length - 30} more lines`));
+              }
+              if (s.sessionFile) {
+                contentLines.push(theme.fg("muted", `Session file: ${s.sessionFile}`));
+              }
+            }
+            const followUps = steps.filter((s) => s.name).map((s) => `"${s.name}"`);
+            if (followUps.length > 0) {
+              contentLines.push("");
+              contentLines.push(
+                theme.fg(
+                  "dim",
+                  `Follow up:  subagent_message({ name: "<step name>", message: "…" }) — steps: ${followUps.join(", ")}`,
+                ),
+              );
+            }
+          } else {
+            // Collapsed: preview of the last step that produced output
+            const lastRan = [...steps].reverse().find((s) => s.output || s.summary);
+            if (lastRan) {
+              const previewLines = String(lastRan.output ?? lastRan.summary ?? "").split("\n").slice(0, 4);
+              for (const line of previewLines) {
+                contentLines.push(theme.fg("dim", line.slice(0, width - 6)));
+              }
+            }
+            contentLines.push(theme.fg("muted", keyHint("app.tools.expand", "to expand")));
+          }
+
+          const box = new Box(1, 1, bgFn);
+          box.addChild(new Text(contentLines.join("\n"), 0, 0));
+          return ["", ...box.render(width)];
+        },
+      };
+    }
 
     return {
       render(width: number): string[] {
