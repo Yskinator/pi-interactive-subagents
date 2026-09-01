@@ -3160,6 +3160,112 @@ describe("subagent chain", () => {
       testApi.runningSubagents.clear();
     }
   });
+
+  // ── Real runStep (launch/watch stubbed) — widget refresh across steps ──
+
+  it("re-arms the widget refresh for every chain step (bar must not vanish after step 1)", async () => {
+    const { api, registeredTools, sentMessages } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const setWidgetCalls: Array<any> = [];
+    // Recording UI: updateWidget() early-returns without hasUI, so a fake
+    // ctx is needed to observe the widget being cleared/re-shown.
+    testApi.setLatestCtxForTest({
+      hasUI: true,
+      ui: { setWidget: (key: string, value: any) => setWidgetCalls.push(value) },
+    });
+
+    let releaseStep1: () => void;
+    const step1Gate = new Promise<void>((r) => (releaseStep1 = r));
+    let releaseStep2: () => void;
+    const step2Gate = new Promise<void>((r) => (releaseStep2 = r));
+    let launchCalls = 0;
+    let watchCalls = 0;
+    const origLaunch = testApi.subagentOps.launch;
+    const origWatch = testApi.subagentOps.watch;
+    testApi.subagentOps.launch = async (params: any) => {
+      launchCalls++;
+      // Hold step 2 back so the test can observe the empty-map state between steps.
+      if (launchCalls > 1) await step2Gate;
+      const fake = makeFakeRunning(params.name);
+      testApi.runningSubagents.set(fake.id, fake);
+      return fake;
+    };
+    testApi.subagentOps.watch = async (running: any) => {
+      watchCalls++;
+      // Note: no refresh assertions inside this stub — a throw here would be
+      // swallowed into step.errorMessage by runChain's try/catch and surface
+      // later with a misleading message. The asserts below are the check.
+      if (watchCalls === 1) {
+        await step1Gate;
+      } else {
+        // Linger briefly so the test can observe step 2 mid-run (the real
+        // watcher stays for the step's whole duration).
+        await new Promise((r) => setTimeout(r, 300));
+      }
+      testApi.runningSubagents.delete(running.id);
+      return { name: running.name, task: running.task, summary: watchCalls === 1 ? "S1" : "S2", exitCode: 0, elapsed: 1 };
+    };
+    try {
+      await subagentTool.execute(
+        "call-1",
+        { name: "reg-chain", chain: [{ agent: "worker", task: "a" }, { agent: "worker", task: "b" }] },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+
+      // (a) Step 1 running: refresh armed.
+      for (let i = 0; i < 50 && testApi.runningSubagents.size !== 1; i++) await chainSleep(10);
+      assert.equal(testApi.runningSubagents.size, 1, "step 1 should be running");
+      assert.equal(testApi.widgetRefreshActive(), true, "refresh armed while step 1 runs");
+
+      // (b) Release step 1; once it leaves the map the pre-fix state is
+      // reached: refresh cleared, widget removed.
+      releaseStep1();
+      for (let i = 0; i < 50 && testApi.runningSubagents.size !== 0; i++) await chainSleep(10);
+      assert.equal(testApi.runningSubagents.size, 0, "step 1 should be done");
+      assert.equal(testApi.widgetRefreshActive(), false, "refresh cleared with an empty map");
+      assert.equal(setWidgetCalls[setWidgetCalls.length - 1], undefined, "widget cleared after step 1");
+      const clearedAt = setWidgetCalls.length - 1;
+
+      // (c) Step 2 running: refresh re-armed (the fix) and widget re-shown.
+      releaseStep2();
+      for (let i = 0; i < 50 && testApi.runningSubagents.size !== 1; i++) await chainSleep(10);
+      assert.equal(testApi.runningSubagents.size, 1, "step 2 should be running");
+      assert.equal(testApi.widgetRefreshActive(), true, "refresh re-armed for step 2");
+      assert.ok(
+        setWidgetCalls.slice(clearedAt + 1).some((v) => typeof v === "function"),
+        "widget re-shown for step 2 after the step 1 clear",
+      );
+
+      // (d) After the aggregate steer: chain truly finished, widget gone.
+      for (let i = 0; i < 100 && !sentMessages.some((m) => m.message?.details?.chain === true); i++)
+        await chainSleep(10);
+      assert.ok(sentMessages.some((m) => m.message?.details?.chain === true), "aggregate chain steer sent");
+      assert.equal(testApi.runningSubagents.size, 0, "no running subagents after the chain");
+      assert.equal(testApi.widgetRefreshActive(), false, "refresh cleared when the chain finishes");
+      assert.equal(setWidgetCalls[setWidgetCalls.length - 1], undefined, "widget cleared after the final step");
+    } finally {
+      releaseStep1?.();
+      releaseStep2?.();
+      // If an assertion above failed, the chain may still be running. Abort
+      // it (still while the stubs are installed) so an in-flight step's real
+      // watchSubagent bails on the aborted signal instead of polling tmux on
+      // the fake "%stub" surface. On the green path the chain is already
+      // finished and this is a no-op.
+      const leftover = testApi.getChainMapForSession(sessionId).get("reg-chain");
+      if (leftover && !leftover.finished) {
+        leftover.aborted = true;
+        leftover.abortController.abort();
+      }
+      testApi.subagentOps.launch = origLaunch;
+      testApi.subagentOps.watch = origWatch;
+      testApi.setLatestCtxForTest(null);
+      testApi.runningSubagents.clear();
+    }
+  });
 });
 
 describe("subagent activity snapshots", () => {

@@ -976,14 +976,21 @@ type ChainStepRunner = (
   },
 ) => Promise<ChainStepRunResult>;
 
+/** Launch/watch behind a seam so the real runStep can be unit-tested
+ * without tmux (same isolation convention as chainHooks). */
+const subagentOps: { launch: typeof launchSubagent; watch: typeof watchSubagent } = {
+  launch: launchSubagent,
+  watch: watchSubagent,
+};
+
 /**
  * Per-step runner for chains: launch a pane, register the name, watch until
  * the step exits. Isolated behind a hook so unit tests can replace it
  * (spawning real tmux panes is integration-test territory).
  */
 const chainHooks: { runStep: ChainStepRunner } = {
-  runStep: async (step, ctx, parentArtifactDir, _pi, signal, { onLaunched, onSurfaceLost }) => {
-    const running = await launchSubagent(
+  runStep: async (step, ctx, parentArtifactDir, pi, signal, { onLaunched, onSurfaceLost }) => {
+    const running = await subagentOps.launch(
       {
         agent: step.agent,
         task: step.task,
@@ -993,12 +1000,17 @@ const chainHooks: { runStep: ChainStepRunner } = {
       },
       ctx,
     );
+    // The previous step's completion cleared the refresh timers while
+    // runningSubagents was empty; without re-arming them, this step's row
+    // never renders (or renders once with a frozen elapsed timer).
+    startWidgetRefresh();
+    startStatusRefresh(pi);
     onLaunched(running);
     registerName(parentArtifactDir, running.name, {
       sessionFile: running.sessionFile,
       sessionId: getSessionId(running.sessionFile),
     });
-    const result = await watchSubagent(running, signal, {
+    const result = await subagentOps.watch(running, signal, {
       onTick: () => {
         if (!isSurfaceAlive(running.surface)) onSurfaceLost();
       },
@@ -1922,6 +1934,7 @@ export const __test__ = {
   // Chain internals (unit-test hooks)
   buildChainStepTask,
   chainHooks,
+  subagentOps,
   formatChainPresentation,
   truncateChainOutput,
   startChain,
@@ -1941,6 +1954,14 @@ export const __test__ = {
       statusInterval = null;
       (globalThis as any)[STATUS_INTERVAL_KEY] = null;
     }
+  },
+  /** Test hook: install a fake ExtensionContext so updateWidget() renders into a recorder. */
+  setLatestCtxForTest(ctx: unknown) {
+    latestCtx = ctx as any;
+  },
+  /** Test hook: is the widget refresh interval currently armed? */
+  widgetRefreshActive() {
+    return widgetInterval !== null;
   },
   // /agent_model internals (unit-test hooks)
   parseModelOverridesEnv,
