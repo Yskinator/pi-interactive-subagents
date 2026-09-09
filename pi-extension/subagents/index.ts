@@ -759,6 +759,10 @@ interface RunningSubagent {
   name: string;
   task: string;
   agent?: string;
+  /** 1-based index of the running step within the parent chain (chain steps only). */
+  chainStep?: number;
+  /** Total number of steps in the parent chain (chain steps only). */
+  chainStepTotal?: number;
   surface: string;
   startTime: number;
   sessionFile: string;
@@ -1080,6 +1084,8 @@ async function runChain(
         {
           onLaunched: (running) => {
             chain.currentRunning = running;
+            running.chainStep = step.index;
+            running.chainStepTotal = chain.steps.length;
           },
           onSurfaceLost: () => {
             chain.surfaceLost = true;
@@ -1415,9 +1421,13 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
   for (const agent of agents) {
     const elapsed = formatElapsedMMSS(agent.startTime);
     const agentTag = agent.agent ? ` (${agent.agent})` : "";
+    const chainTag =
+      agent.chainStep != null && agent.chainStepTotal != null
+        ? ` ${agent.chainStep}/${agent.chainStepTotal}`
+        : "";
     const snapshot = classifyStatus(agent.statusState, Date.now());
     const icon = widgetIcon(snapshot.kind);
-    const left = ` ${icon} ${elapsed}  ${agent.name}${agentTag} `;
+    const left = ` ${icon} ${elapsed}  ${agent.name}${agentTag}${chainTag} `;
     const right = statusConfig.enabled
       ? formatWidgetRightLabel(snapshot)
       : agent.cli === "claude"

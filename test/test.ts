@@ -2848,8 +2848,19 @@ describe("subagent chain", () => {
     const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
 
     const calls: any[] = [];
+    const launched: any[] = [];
     const original = testApi.chainHooks.runStep;
-    testApi.chainHooks.runStep = async (step: any, _ctx: any, parentArtifactDir: any) => {
+    testApi.chainHooks.runStep = async (
+      step: any,
+      _ctx: any,
+      parentArtifactDir: any,
+      _pi: any,
+      _signal: AbortSignal,
+      hooks: any,
+    ) => {
+      const fake = makeFakeRunning(step.name);
+      hooks.onLaunched(fake);
+      launched.push(fake);
       calls.push({ agent: step.agent, task: step.task, name: step.name });
       registerName(parentArtifactDir, step.name, {
         sessionFile: join(sessionDir, `sub-${step.name}.jsonl`),
@@ -2900,6 +2911,15 @@ describe("subagent chain", () => {
         ["worker", "reviewer", "worker-2"],
         "default step names are auto-suffixed on collision",
       );
+
+      // The live running object each step reports as launched gets the 1-based
+      // step counter attached via onLaunched (what the widget's "1/3" column
+      // reads off the runningSubagents map).
+      assert.equal(launched.length, 3, "onLaunched was invoked for every step");
+      launched.forEach((fake: any, i: number) => {
+        assert.equal(fake.chainStep, i + 1, `step ${i + 1} gets its 1-based index`);
+        assert.equal(fake.chainStepTotal, 3, `step ${i + 1} gets the total step count`);
+      });
 
       // Automatic hand-off: each task starts with its own task and ends with
       // the previous step's output — no placeholder, no manual pasting.
@@ -4146,6 +4166,8 @@ describe("subagent startup delay", () => {
   });
 });
 describe("subagents widget rendering", () => {
+  const stripAnsi = (line: string) => line.replace(/\x1b\[[0-9;]*m/g, "");
+
   it("keeps every rendered line within a very narrow width", () => {
     const testApi = (subagentsModule as any).__test__;
     assert.ok(testApi, "expected subagents test helpers to be exported");
@@ -4228,6 +4250,130 @@ describe("subagents widget rendering", () => {
           `expected line width <= ${width}, got ${visibleWidth(line)} for ${JSON.stringify(line)}`,
         );
       }
+    }
+  });
+
+  it("shows a current/total step counter next to the agent tag for chain steps", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.ok(testApi, "expected subagents test helpers to be exported");
+    assert.equal(typeof testApi.renderSubagentWidgetLines, "function");
+
+    const originalNow = Date.now;
+    Date.now = () => 1_000_000;
+    try {
+      for (const step of [1, 2, 3]) {
+        const lines = testApi.renderSubagentWidgetLines(
+          [
+            {
+              id: "c1",
+              name: "finalize-fit-redesign",
+              agent: "worker",
+              chainStep: step,
+              chainStepTotal: 3,
+              task: "",
+              surface: "s1",
+              startTime: 1_000_000 - 44_000,
+              sessionFile: "sess1",
+              statusState: createStatusState({ source: "pi", startTimeMs: 1_000_000 - 44_000 }),
+            },
+          ],
+          100,
+        );
+
+        const row = stripAnsi(lines[1]);
+        assert.ok(
+          row.includes(`finalize-fit-redesign (worker) ${step}/3 `),
+          `expected "${step}/3" next to the agent tag, got: ${row}`,
+        );
+      }
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
+  it("renders non-chain rows exactly as before (no counter, no stray spaces)", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.ok(testApi, "expected subagents test helpers to be exported");
+    assert.equal(typeof testApi.renderSubagentWidgetLines, "function");
+
+    const originalNow = Date.now;
+    Date.now = () => 1_000_000;
+    try {
+      const startTime = 1_000_000 - 44_000;
+      const state = createStatusState({ source: "pi", startTimeMs: startTime });
+      const snapshot = classifyStatus(state, 1_000_000);
+      const icon = stripAnsi(testApi.widgetIcon(snapshot.kind));
+      const right = testApi.formatWidgetRightLabel(snapshot);
+
+      // With an agent tag: the row must match the pre-counter layout exactly.
+      const tagged = {
+        id: "a1",
+        name: "worker-1",
+        agent: "worker",
+        task: "",
+        surface: "s1",
+        startTime,
+        sessionFile: "sess1",
+        statusState: state,
+      };
+      const taggedRow = stripAnsi(testApi.renderSubagentWidgetLines([tagged], 80)[1]);
+      const expectedTagged = stripAnsi(
+        testApi.borderLine(` ${icon} 00:44  worker-1 (worker) `, right, 80),
+      );
+      assert.equal(taggedRow, expectedTagged);
+      assert.ok(!/\d+\/\d+/.test(taggedRow), `expected no step counter, got: ${taggedRow}`);
+
+      // Without an agent tag: same, and no stray spaces where a tag would be.
+      const untagged = { ...tagged, id: "a2", name: "solo", agent: undefined, surface: "s2", sessionFile: "sess2" };
+      const untaggedRow = stripAnsi(testApi.renderSubagentWidgetLines([untagged], 80)[1]);
+      const expectedUntagged = stripAnsi(
+        testApi.borderLine(` ${icon} 00:44  solo `, right, 80),
+      );
+      assert.equal(untaggedRow, expectedUntagged);
+      assert.ok(!/\d+\/\d+/.test(untaggedRow), `expected no step counter, got: ${untaggedRow}`);
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
+  it("keeps chain-step rows within the width limit when the counter is present", () => {
+    const testApi = (subagentsModule as any).__test__;
+    assert.ok(testApi, "expected subagents test helpers to be exported");
+    assert.equal(typeof testApi.renderSubagentWidgetLines, "function");
+
+    const originalNow = Date.now;
+    Date.now = () => 1_000_000;
+    try {
+      const startTime = 1_000_000 - 44_000;
+      const agent = {
+        id: "c1",
+        name: "finalize-fit-redesign",
+        agent: "worker",
+        chainStep: 1,
+        chainStepTotal: 3,
+        task: "",
+        surface: "s1",
+        startTime,
+        sessionFile: "sess1",
+        statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
+      };
+
+      // Narrow widths truncate the left content (counter included) rather than
+      // overflow; wide widths keep the counter intact.
+      for (const width of [0, 1, 2, 16, 20, 24, 40, 60]) {
+        const lines = testApi.renderSubagentWidgetLines([agent], width);
+        for (const line of lines) {
+          assert.ok(
+            visibleWidth(line) <= width,
+            `expected line width <= ${width}, got ${visibleWidth(line)} for ${JSON.stringify(line)}`,
+          );
+        }
+      }
+
+      const wideRow = stripAnsi(testApi.renderSubagentWidgetLines([agent], 100)[1]);
+      assert.ok(wideRow.includes("finalize-fit-redesign (worker) 1/3 "), wideRow);
+    } finally {
+      Date.now = originalNow;
     }
   });
 });
