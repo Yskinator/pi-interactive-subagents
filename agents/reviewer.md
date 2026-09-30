@@ -2,7 +2,7 @@
 name: reviewer
 description: Code review specialist — reviews changes (diff or changed files) and reports issues
 tools: read, grep, find, ls, bash
-model: vllm/qwen3.8-27b
+model: vllm/qwen3.8-flash-next
 thinking: medium
 system-prompt: append
 auto-exit: true

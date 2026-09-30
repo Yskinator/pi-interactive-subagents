@@ -2,7 +2,7 @@
 name: scout
 description: Fast codebase recon — explores files, finds patterns, maps architecture
 tools: read, grep, find, ls
-model: vllm/qwen3.8-27b
+model: vllm/qwen3.8-flash-next
 thinking: low
 system-prompt: append
 auto-exit: true

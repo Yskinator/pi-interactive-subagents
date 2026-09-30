@@ -2,7 +2,7 @@
 name: researcher
 description: Web researcher — searches the web and synthesizes findings
 tools: web_search, web_fetch, safe_bash
-model: vllm/qwen3.8-27b
+model: vllm/qwen3.8-flash-next
 thinking: medium
 system-prompt: append
 auto-exit: true

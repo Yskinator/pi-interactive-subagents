@@ -3,7 +3,7 @@ name: planner
 description: Creates implementation plans from requirements and codebase context
 tools: read, grep, find, ls
 subagent_agents: scout
-model: vllm/qwen3.8-27b
+model: vllm/qwen3.8-flash-next
 thinking: medium
 system-prompt: append
 auto-exit: true

@@ -3,7 +3,7 @@ name: worker
 description: General-purpose worker — reads, writes, and edits code
 tools: read, write, edit, bash
 subagent_agents: scout, planner, reviewer
-model: vllm/qwen3.8-27b
+model: vllm/qwen3.8-flash-next
 thinking: high
 system-prompt: append
 auto-exit: true

@@ -99,11 +99,11 @@ A sub-agent can ask its orchestrator a single freeform question when requirement
 
 | Agent | Model | Tools | Role |
 | ----- | ----- | ----- | ---- |
-| **scout** | `vllm/qwen3.8-27b` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
-| **researcher** | `vllm/qwen3.8-27b` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
-| **planner** | `vllm/qwen3.8-27b` | `read`, `grep`, `find`, `ls` + spawning | Concrete implementation plans (Goal / Plan / Files to Modify / Risks); may spawn `scout` to gather context |
-| **worker** | `vllm/qwen3.8-27b` | `read`, `write`, `edit`, `bash` + spawning | General implementer; may spawn `scout`, `planner`, and `reviewer` |
-| **reviewer** | `vllm/qwen3.8-27b` | `read`, `grep`, `find`, `ls`, `bash` (read-only) | Code review: diff/changed files → structured findings (Critical / Warnings / Suggestions) |
+| **scout** | `vllm/qwen3.8-flash-next` | `read`, `grep`, `find`, `ls` | Fast read-only codebase recon |
+| **researcher** | `vllm/qwen3.8-flash-next` | `web_search`, `web_fetch`, `safe_bash` | Web research, synthesized into a sourced brief |
+| **planner** | `vllm/qwen3.8-flash-next` | `read`, `grep`, `find`, `ls` + spawning | Concrete implementation plans (Goal / Plan / Files to Modify / Risks); may spawn `scout` to gather context |
+| **worker** | `vllm/qwen3.8-flash-next` | `read`, `write`, `edit`, `bash` + spawning | General implementer; may spawn `scout`, `planner`, and `reviewer` |
+| **reviewer** | `vllm/qwen3.8-flash-next` | `read`, `grep`, `find`, `ls`, `bash` (read-only) | Code review: diff/changed files → structured findings (Critical / Warnings / Suggestions) |
 
 All five are autonomous (`auto-exit: true`) and carry their identity in the system prompt (`system-prompt: append`). The `reviewer` is the natural middle step of a `worker → reviewer → worker` [chain](#chains), and a `planner` in front of a `worker` (e.g. `[{agent: "planner", …}, {agent: "worker", task: "Execute the plan"}]`) turns a vague brief into a plan, then a verbatim execution.
 
@@ -124,7 +124,7 @@ Place a `.md` file in `.pi/agents/` (project) or `~/.pi/agent/agents/` (global).
 ---
 name: my-agent
 description: Does something specific
-model: vllm/qwen3.8-27b
+model: vllm/qwen3.8-flash-next
 thinking: medium
 tools: read, edit, write, safe_bash, web_search
 session-mode: lineage-only
