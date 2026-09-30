@@ -5,6 +5,9 @@ import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { visibleWidth } from "@mariozechner/pi-tui";
+// Must come first: it scrubs the ambient sub-agent env the extension seeds at
+// module load (PI_SUBAGENT_ALLOWED). Keep it above every pi-extension import.
+import "./hermetic-env.ts";
 import * as subagentsModule from "../pi-extension/subagents/index.ts";
 
 import {
@@ -2695,12 +2698,29 @@ describe("subagent chain", () => {
   let sessionDir: string;
   let sessionId: string;
 
+  // startChain reads PI_SUBAGENT_AGENT per call for its self-spawn guard and
+  // PI_SUBAGENT_ALLOWED for the allowlist guard, and both reject the chain
+  // before registering it — which would leave getChainMapForSession() empty for
+  // every orchestration test below. Run each test as a plain top-level session
+  // and hand back whatever the environment held beforehand in afterEach, so a
+  // test that sets one of them itself cannot leak into the next one. (The
+  // module-load half of PI_SUBAGENT_ALLOWED is handled by ./hermetic-env.ts,
+  // which normally means these snapshot as unset.)
+  const saved = {
+    agent: process.env.PI_SUBAGENT_AGENT,
+    allowed: process.env.PI_SUBAGENT_ALLOWED,
+  };
+
   beforeEach(() => {
     sessionDir = createTestDir();
     sessionId = `sess-${Math.random().toString(36).slice(2)}`;
+    delete process.env.PI_SUBAGENT_AGENT;
+    delete process.env.PI_SUBAGENT_ALLOWED;
   });
 
   afterEach(() => {
+    restoreEnvVar("PI_SUBAGENT_AGENT", saved.agent);
+    restoreEnvVar("PI_SUBAGENT_ALLOWED", saved.allowed);
     testApi.stopTimersForTest();
     try {
       rmSync(sessionDir, { recursive: true, force: true });
