@@ -618,6 +618,7 @@ describe("session.ts", () => {
   describe("summarizeSessionStats", () => {
     const asstWithUsage = (id: string, opts: {
       model?: string;
+      provider?: string;
       tools?: string[];
       usage?: Record<string, unknown>;
     }) => ({
@@ -627,6 +628,7 @@ describe("session.ts", () => {
       message: {
         role: "assistant",
         ...(opts.model ? { model: opts.model } : {}),
+        ...(opts.provider ? { provider: opts.provider } : {}),
         content: [
           { type: "text", text: "ok" },
           ...(opts.tools ?? []).map((name, i) => ({ type: "toolCall", name, id: `${id}-tc${i}` })),
@@ -668,6 +670,38 @@ describe("session.ts", () => {
         asstWithUsage("a1", { model: "claude-sonnet-4-6", usage: { totalTokens: 10, cost: { total: 0 } } }),
       ]);
       assert.equal(summarizeSessionStats(file)!.model, "claude-sonnet-4-6");
+    });
+
+    it("captures the provider that pairs with the model", () => {
+      // The gauge needs the provider: the same bare id can exist under two
+      // providers, and summarizeSessionStats used to discard the sibling field.
+      const file = createSessionFile(dir, [
+        SESSION_HEADER,
+        { type: "model_change", id: "mc-001", parentId: null, provider: "llama.cpp", modelId: "qwen3.8-27b" },
+        asstWithUsage("a1", { usage: { totalTokens: 10, cost: { total: 0 } } }),
+      ]);
+      assert.equal(summarizeSessionStats(file)!.model, "qwen3.8-27b");
+      assert.equal(summarizeSessionStats(file)!.provider, "llama.cpp");
+
+      // A per-message model wins, and so does its own provider.
+      const withMsg = createSessionFile(dir, [
+        SESSION_HEADER,
+        { type: "model_change", id: "mc-001", parentId: null, provider: "llama.cpp", modelId: "qwen3.8-27b" },
+        asstWithUsage("a1", {
+          model: "qwen3.8-flash-next",
+          provider: "vllm",
+          usage: { totalTokens: 10, cost: { total: 0 } },
+        }),
+      ]);
+      assert.equal(summarizeSessionStats(withMsg)!.model, "qwen3.8-flash-next");
+      assert.equal(summarizeSessionStats(withMsg)!.provider, "vllm");
+
+      // No provider recorded anywhere stays null (bare-id matching still applies).
+      const bare = createSessionFile(dir, [
+        SESSION_HEADER,
+        { type: "model_change", id: "mc-001", parentId: null, modelId: "qwen3.8-27b" },
+      ]);
+      assert.equal(summarizeSessionStats(bare)!.provider, null);
     });
 
     it("handles missing usage gracefully", () => {
@@ -2822,7 +2856,12 @@ describe("subagent chain", () => {
         undefined,
         mockCtx(),
       );
-      assert.match(result.details?.error, /unknown chain agent|not in allowlist/);
+      // The ambient PI_SUBAGENT_ALLOWED is scrubbed at import (hermetic-env.ts)
+      // and this suite deletes the var per test, so SUBAGENT_ALLOWLIST is null
+      // here and only the "unknown chain agent" branch is reachable. The
+      // allowlist branch is covered in the "subagent spawn guards" suite, which
+      // loads a second module instance with the var set.
+      assert.match(result.details?.error, /^unknown chain agent$/);
       assert.equal(result.details?.step, 2);
     } finally {
       testApi.chainHooks.runStep = original;
@@ -3305,6 +3344,450 @@ describe("subagent chain", () => {
       testApi.setLatestCtxForTest(null);
       testApi.runningSubagents.clear();
     }
+  });
+});
+
+// ── Sub-agent spawn guards ──
+//
+// Three guards are invisible to every suite above, because they only fire for a
+// process that IS itself a sub-agent:
+//   • startChain() rejects a chain that contains a step spawning the CURRENT
+//     agent — read per call from PI_SUBAGENT_AGENT — and it must do so before
+//     registering the chain, so nothing can half-run;
+//   • the single-spawn path has the same self-spawn guard for agent + task;
+//   • PI_SUBAGENT_ALLOWED, snapshotted into the module-level SUBAGENT_ALLOWLIST
+//     at load, restricts both paths to the pinned agent set.
+// The first two are read per call, so they are testable on the imported module
+// by setting the env var in the test body. The third one is not: the snapshot
+// already happened during import, which is why loadModuleWithEnv() below loads a
+// second, throwaway module instance with the env it wants.
+describe("subagent spawn guards", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  // Ambient values are scrubbed at import (./hermetic-env.ts); each test opts
+  // into a sub-agent identity explicitly and hands back whatever the
+  // environment held, so nothing leaks into the suites that run after this one.
+  const saved = {
+    agent: process.env.PI_SUBAGENT_AGENT,
+    allowed: process.env.PI_SUBAGENT_ALLOWED,
+  };
+
+  let sessionDir: string;
+  let sessionId: string;
+
+  beforeEach(() => {
+    sessionDir = createTestDir();
+    sessionId = `guard-${Math.random().toString(36).slice(2)}`;
+    delete process.env.PI_SUBAGENT_AGENT;
+    delete process.env.PI_SUBAGENT_ALLOWED;
+  });
+
+  afterEach(() => {
+    restoreEnvVar("PI_SUBAGENT_AGENT", saved.agent);
+    restoreEnvVar("PI_SUBAGENT_ALLOWED", saved.allowed);
+    testApi.stopTimersForTest();
+    try {
+      rmSync(sessionDir, { recursive: true, force: true });
+    } catch {}
+  });
+
+  function mockCtx(overrides: { getSessionFile?: () => string | null } = {}) {
+    return {
+      sessionManager: {
+        getSessionFile: overrides.getSessionFile ?? (() => join(sessionDir, "session.jsonl")),
+        getSessionId: () => sessionId,
+        getSessionDir: () => sessionDir,
+      },
+      cwd: sessionDir,
+    } as any;
+  }
+
+  /**
+   * A ctx whose session file is missing. Validation passes and the call stops
+   * at the session-file check instead of launching anything — the deterministic
+   * way to prove a guard did NOT fire without touching tmux.
+   */
+  function mockCtxNoSession() {
+    return mockCtx({ getSessionFile: () => null });
+  }
+
+  /** Stub a chain step runner so a rejection can be proven to launch nothing. */
+  function stubRunStep(api: any = testApi) {
+    const original = api.chainHooks.runStep;
+    const calls = { count: 0 };
+    api.chainHooks.runStep = async () => {
+      calls.count++;
+    };
+    return {
+      calls,
+      restore: () => {
+        api.chainHooks.runStep = original;
+      },
+    };
+  }
+
+  /**
+   * Stub the launch path so a rejection can be proven to launch nothing. NOTE:
+   * this seam only covers the CHAIN path (chainHooks.runStep -> subagentOps.launch,
+   * index.ts:997). The single-spawn path calls launchSubagent() directly
+   * (index.ts:2742), so for single-spawn tests this counter is only a
+   * belt-and-braces check — those tests must instead rely on mockCtxNoSession()
+   * to stop before any pane is opened.
+   */
+  function stubLaunch(api: any = testApi) {
+    const origLaunch = api.subagentOps.launch;
+    const origWatch = api.subagentOps.watch;
+    const calls = { count: 0 };
+    api.subagentOps.launch = async () => {
+      calls.count++;
+      throw new Error("launchSubagent must not be reached");
+    };
+    api.subagentOps.watch = async () => {
+      calls.count++;
+      throw new Error("watchSubagent must not be reached");
+    };
+    return {
+      calls,
+      restore: () => {
+        api.subagentOps.launch = origLaunch;
+        api.subagentOps.watch = origWatch;
+      },
+    };
+  }
+
+  // Loading a second instance of the extension touches process-global
+  // singletons (see the top of pi-extension/subagents/index.ts): it clears the
+  // previous widget/status intervals and aborts the previous poll controller.
+  // Park them around the import and hand the main instance's hooks back
+  // afterwards, so the throwaway instance cannot disturb the rest of the suite.
+  const GLOBAL_KEYS = {
+    widget: Symbol.for("pi-subagents/widget-interval"),
+    status: Symbol.for("pi-subagents/status-interval"),
+    poll: Symbol.for("pi-subagents/poll-abort-controller"),
+    children: Symbol.for("pi-subagents/running-children-count"),
+  };
+
+  /**
+   * Import a FRESH instance of the extension with `env` set at load time.
+   * SUBAGENT_ALLOWLIST is a module-level const seeded from the environment, so
+   * the statically imported instance can never observe a non-null allowlist.
+   * A query string on the module URL makes this a distinct module record — the
+   * key encodes the env, so the same request reuses the same cached instance.
+   * Nothing is started by importing or by default(api) (every handler goes
+   * through the mocked api.on()), so the instance owns no timers or watchers.
+   * Only index.ts is re-evaluated — session.ts/tmux.ts/status.ts stay the
+   * already-loaded modules, so their module state remains SHARED with the main
+   * instance (the notEqual checks below therefore prove index-level isolation).
+   * Note: in a fresh checkout or a /tmp copy of the repo this import pulls in
+   * status.ts, which throws at module load when neither config.json nor
+   * config.json.example exists next to the package root (status.ts:11).
+   */
+  async function loadModuleWithEnv(env: Record<string, string | undefined>): Promise<any> {
+    const g = globalThis as any;
+    const parked = {
+      widget: g[GLOBAL_KEYS.widget],
+      status: g[GLOBAL_KEYS.status],
+      poll: g[GLOBAL_KEYS.poll],
+      children: g[GLOBAL_KEYS.children],
+      registry: g.__pi_interactive_subagents,
+    };
+    // Hide the live intervals from the new load: it would clearInterval() them
+    // while the main instance still holds the handles and thinks they are armed.
+    g[GLOBAL_KEYS.widget] = null;
+    g[GLOBAL_KEYS.status] = null;
+
+    const previous: Array<[string, string | undefined]> = [];
+    for (const [name, value] of Object.entries(env)) {
+      previous.push([name, process.env[name]]);
+      restoreEnvVar(name, value);
+    }
+    let fresh: any;
+    try {
+      const key = encodeURIComponent(
+        Object.entries(env)
+          .map(([name, value]) => `${name}=${value ?? ""}`)
+          .join("&"),
+      );
+      fresh = await import(`../pi-extension/subagents/index.ts?env=${key}`);
+    } finally {
+      for (const [name, value] of previous.reverse()) restoreEnvVar(name, value);
+      g[GLOBAL_KEYS.widget] = parked.widget;
+      g[GLOBAL_KEYS.status] = parked.status;
+      g[GLOBAL_KEYS.children] = parked.children;
+      g.__pi_interactive_subagents = parked.registry;
+      // The import aborted the shared poll controller; hand back a live one so
+      // watchers in the main instance keep behaving as before. In practice the
+      // import already installed a fresh controller in this slot, so the
+      // `aborted` branch rarely fires — but the main instance's ORIGINAL
+      // controller stays aborted either way (index.ts aborts it on module load),
+      // which would matter only if a watcher were in flight across the import.
+      g[GLOBAL_KEYS.poll] = parked.poll?.signal.aborted ? new AbortController() : parked.poll;
+    }
+    return fresh;
+  }
+
+  // ── Self-spawn guard: chain mode (PI_SUBAGENT_AGENT is read per call) ──
+
+  it("rejects a chain whose first step would spawn the current agent", async () => {
+    const { api, registeredTools, sentMessages } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const steps = stubRunStep();
+    process.env.PI_SUBAGENT_AGENT = "worker";
+    try {
+      const result = await subagentTool.execute(
+        "call-1",
+        { chain: [{ agent: "worker", task: "a" }, { agent: "reviewer", task: "b" }] },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(result.details?.error, "self-spawn blocked");
+      assert.equal(result.details?.step, 1);
+      assert.equal(
+        result.content[0].text,
+        "You are the worker agent — a chain cannot include another worker. " +
+          "You were spawned to do that work yourself.",
+      );
+    } finally {
+      steps.restore();
+    }
+    assert.equal(steps.calls.count, 0, "no step should have launched");
+    assert.equal(sentMessages.length, 0, "no chain steer should have been sent");
+    assert.equal(testApi.getChainMapForSession(sessionId).size, 0, "the chain must not be registered");
+  });
+
+  it("rejects a chain that only self-spawns in a later step, with nothing half-run", async () => {
+    const { api, registeredTools, sentMessages } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const steps = stubRunStep();
+    process.env.PI_SUBAGENT_AGENT = "planner";
+    try {
+      const result = await subagentTool.execute(
+        "call-1",
+        { chain: [{ agent: "scout", task: "a" }, { agent: "planner", task: "b" }] },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(result.details?.error, "self-spawn blocked");
+      assert.equal(result.details?.step, 2, "the offending step is reported");
+      assert.match(result.content[0].text, /^You are the planner agent — a chain cannot include another planner\./);
+    } finally {
+      steps.restore();
+    }
+    assert.equal(steps.calls.count, 0, "step 1 must not run either — the whole chain is rejected");
+    assert.equal(sentMessages.length, 0, "no chain steer should have been sent");
+    assert.equal(testApi.getChainMapForSession(sessionId).size, 0, "the chain must not be registered");
+  });
+
+  it("accepts the same chain when the caller is not a sub-agent (the guard is env-driven)", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const steps = stubRunStep();
+    // No PI_SUBAGENT_AGENT: this is a top-level session, so spawning "worker"
+    // is legitimate. The ctx has no session file, so the call stops at the
+    // prerequisite check instead of launching anything.
+    try {
+      const result = await subagentTool.execute(
+        "call-1",
+        { chain: [{ agent: "worker", task: "a" }] },
+        undefined,
+        undefined,
+        mockCtxNoSession(),
+      );
+      assert.notEqual(result.details?.error, "self-spawn blocked", "a top-level session may spawn any agent");
+      assert.match(String(result.details?.error), /no session file|tmux not available/);
+    } finally {
+      steps.restore();
+    }
+    assert.equal(steps.calls.count, 0, "nothing should have launched");
+    assert.equal(testApi.getChainMapForSession(sessionId).size, 0, "the chain must not be registered");
+  });
+
+  // ── Self-spawn guard: single-spawn mode ──
+
+  it("rejects a single self-spawn of the current agent", async () => {
+    const { api, registeredTools, sentMessages } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const launch = stubLaunch();
+    process.env.PI_SUBAGENT_AGENT = "planner";
+    try {
+      const result = await subagentTool.execute(
+        "call-1",
+        { agent: "planner", task: "plan something" },
+        undefined,
+        undefined,
+        // The guard fires before the session-file check, so a ctx with no
+        // session file still proves it fired — and it guarantees that a
+        // neutered guard stops at "no session file" instead of opening a real
+        // pane (the single-spawn path bypasses the stubLaunch seam).
+        mockCtxNoSession(),
+      );
+      assert.equal(result.details?.error, "self-spawn blocked");
+      assert.equal(
+        result.content[0].text,
+        "You are the planner agent — do not start another planner. " +
+          "You were spawned to do this work yourself. Complete the task directly.",
+      );
+      assert.equal(launch.calls.count, 0, "no pane should have been launched");
+      assert.equal(sentMessages.length, 0, "no steer should have been sent");
+    } finally {
+      launch.restore();
+    }
+  });
+
+  it("lets a sub-agent single-spawn a different agent (the guard is env-driven, not blanket)", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const launch = stubLaunch();
+    process.env.PI_SUBAGENT_AGENT = "planner";
+    try {
+      const result = await subagentTool.execute(
+        "call-1",
+        { agent: "scout", task: "look around" },
+        undefined,
+        undefined,
+        mockCtxNoSession(),
+      );
+      assert.notEqual(result.details?.error, "self-spawn blocked", "another agent is a legitimate spawn");
+      assert.match(String(result.details?.error), /no session file|tmux not available/);
+      assert.equal(launch.calls.count, 0, "stopped at the prerequisite check, before any pane");
+    } finally {
+      launch.restore();
+    }
+  });
+
+  // ── Allowlist branch (PI_SUBAGENT_ALLOWED, seeded into SUBAGENT_ALLOWLIST at load) ──
+
+  describe("PI_SUBAGENT_ALLOWED", () => {
+    const ALLOWED = "scout,planner";
+
+    /** Set up a fresh module instance whose load-time allowlist is ALLOWED. */
+    async function setupAllowlisted(agentEnv?: string) {
+      // The module URL encodes the env, so all four tests below share ONE cached
+      // instance and its mutable chainsBySession — the random sessionId from
+      // beforeEach is what makes the "chain must not be registered" checks
+      // meaningful rather than accidentally empty.
+      const mock = createMockExtensionApi();
+      const fresh = await loadModuleWithEnv({
+        PI_SUBAGENT_ALLOWED: ALLOWED,
+        // The load-time model-override snapshot is seeded the same way; pin it
+        // off so a leftover ambient value cannot leak into this instance.
+        PI_SUBAGENT_MODEL_OVERRIDES: undefined,
+      });
+      const freshApi = (fresh as any).__test__;
+      // Sanity: this really is a second instance with its own state, and the
+      // main instance is untouched (its allowlist stayed null).
+      assert.notEqual(fresh, subagentsModule, "expected a distinct module instance");
+      assert.notEqual(freshApi.chainsBySession, testApi.chainsBySession, "the fresh instance owns its chain maps");
+      assert.notEqual(freshApi.chainHooks, testApi.chainHooks, "the fresh instance owns its step runner");
+      assert.ok(
+        testApi.discoverAgentDefinitions().some((a: any) => a.name === "worker"),
+        "the imported instance must stay unrestricted",
+      );
+      (fresh as any).default(mock.api);
+      if (agentEnv === undefined) delete process.env.PI_SUBAGENT_AGENT;
+      else process.env.PI_SUBAGENT_AGENT = agentEnv;
+      return { mock, fresh, freshApi };
+    }
+
+    it("restricts the discoverable agent set to the allowlist", async () => {
+      const { freshApi } = await setupAllowlisted();
+      const names = freshApi.discoverAgentDefinitions().map((a: any) => a.name).sort();
+      assert.ok(names.includes("planner") && names.includes("scout"), `allowed agents are listed: ${names}`);
+      assert.ok(!names.includes("worker"), `a non-allowed agent must not be listed: ${names}`);
+      // Exactly "what an unrestricted session sees", intersected with the pin.
+      const unrestricted = testApi.discoverAgentDefinitions().map((a: any) => a.name);
+      assert.deepEqual(names, unrestricted.filter((n: string) => ALLOWED.split(",").includes(n)).sort());
+      assert.equal(freshApi.widgetRefreshActive(), false, "importing and registering must not arm a timer");
+    });
+
+    it("rejects a single spawn outside the allowlist, before launching anything", async () => {
+      const { mock, freshApi } = await setupAllowlisted();
+      const subagentTool = mock.registeredTools.find((tool) => tool.name === "subagent");
+      const launch = stubLaunch(freshApi);
+      try {
+        const result = await subagentTool.execute(
+          "call-1",
+          { agent: "worker", task: "do it" },
+          undefined,
+          undefined,
+          // See the note above: the allowlist guard also fires before the
+          // session-file check, and the single-spawn path bypasses the
+          // stubLaunch seam — so keep the ctx session-less.
+          mockCtxNoSession(),
+        );
+        assert.equal(result.details?.error, "agent not in allowlist");
+        assert.equal(
+          result.content[0].text,
+          'You may not spawn the "worker" agent — it is not in your allowlist. Available agents: scout, planner.',
+        );
+        assert.equal(launch.calls.count, 0, "no pane should have been launched");
+        assert.equal(mock.sentMessages.length, 0, "no steer should have been sent");
+      } finally {
+        launch.restore();
+      }
+    });
+
+    it("rejects a chain step outside the allowlist, before registering the chain", async () => {
+      const { mock, freshApi } = await setupAllowlisted();
+      const subagentTool = mock.registeredTools.find((tool) => tool.name === "subagent");
+      const steps = stubRunStep(freshApi);
+      try {
+        const result = await subagentTool.execute(
+          "call-1",
+          { chain: [{ agent: "scout", task: "a" }, { agent: "worker", task: "b" }] },
+          undefined,
+          undefined,
+          mockCtx(),
+        );
+        assert.equal(result.details?.error, "chain agent not in allowlist");
+        assert.equal(result.details?.step, 2);
+        assert.equal(
+          result.content[0].text,
+          'Chain step 2 may not spawn the "worker" agent — it is not in your allowlist. ' +
+            "Available agents: scout, planner.",
+        );
+      } finally {
+        steps.restore();
+      }
+      assert.equal(steps.calls.count, 0, "no step should have launched");
+      assert.equal(mock.sentMessages.length, 0, "no chain steer should have been sent");
+      assert.equal(freshApi.getChainMapForSession(sessionId).size, 0, "the chain must not be registered");
+      assert.equal(freshApi.widgetRefreshActive(), false, "a rejected chain must not arm a refresh timer");
+      // The main instance must not have picked up the fresh instance's chain.
+      assert.equal(testApi.getChainMapForSession(sessionId).size, 0, "the main instance saw nothing");
+    });
+
+    it("still applies the self-spawn guard to an allowlisted agent", async () => {
+      // "planner" passes the allowlist check, so this proves the two guards are
+      // independent: the rejection must come from the self-spawn guard, not the
+      // allowlist one, and it must still land before registration.
+      const { mock, freshApi } = await setupAllowlisted("planner");
+      const subagentTool = mock.registeredTools.find((tool) => tool.name === "subagent");
+      const steps = stubRunStep(freshApi);
+      try {
+        const result = await subagentTool.execute(
+          "call-1",
+          { chain: [{ agent: "planner", task: "plan it" }] },
+          undefined,
+          undefined,
+          mockCtx(),
+        );
+        assert.equal(result.details?.error, "self-spawn blocked");
+        assert.equal(result.details?.step, 1);
+        assert.match(result.content[0].text, /a chain cannot include another planner/);
+      } finally {
+        steps.restore();
+      }
+      assert.equal(steps.calls.count, 0, "no step should have launched");
+      assert.equal(freshApi.getChainMapForSession(sessionId).size, 0, "the chain must not be registered");
+    });
   });
 });
 
@@ -4415,6 +4898,186 @@ describe("subagent display helpers", () => {
       assert.equal(testApi.contextWindowFor("gemini-2.5-pro"), 1_000_000);
       assert.equal(testApi.contextWindowFor("some-unknown-model"), undefined);
       assert.equal(testApi.contextWindowFor(null), undefined);
+    });
+
+    /**
+     * Minimal ModelRegistryLike over a fixed model list — the same idiom as the
+     * fake `modelRegistry.getAvailable` ctx used by the command tests, but with
+     * the synchronous getAll()/find() the gauge uses. `withFind: false` yields a
+     * registry that only exposes getAll() (the /agent_model-style minimal fake).
+     */
+    function fakeRegistry(
+      models: Array<{ id: string; provider?: string; contextWindow?: number }>,
+      opts: { withFind?: boolean } = {},
+    ) {
+      const registry: any = { getAll: () => models };
+      if (opts.withFind !== false) {
+        registry.find = (provider: string, modelId: string) =>
+          models.find((m) => m.provider === provider && m.id === modelId);
+      }
+      return registry;
+    }
+
+    it("prefers a registry hit over the name table", () => {
+      const registry = fakeRegistry([
+        { provider: "anthropic", id: "claude-sonnet-4-6", contextWindow: 400_000 },
+      ]);
+      // The name table would say 200k for anything containing "claude".
+      assert.equal(testApi.contextWindowFor("anthropic/claude-sonnet-4-6", registry), 400_000);
+      // A bare id that matches exactly one registry entry resolves too.
+      assert.equal(testApi.contextWindowFor("claude-sonnet-4-6", registry), 400_000);
+    });
+
+    it("falls back to the name table when the registry has no match", () => {
+      const registry = fakeRegistry([{ provider: "vllm", id: "qwen3.8-flash-next", contextWindow: 250_000 }]);
+      assert.equal(testApi.contextWindowFor("claude-sonnet-4-6", registry), 200_000);
+      assert.equal(testApi.contextWindowFor("openai/gpt-4.1", registry), 128_000);
+      assert.equal(testApi.contextWindowFor("some-unknown-model", registry), undefined);
+    });
+
+    it("resolves a model the name table cannot know from a unique bare id", () => {
+      // The reported bug: vllm/qwen3.8-flash-next rendered as "37k ctx", no gauge.
+      const registry = fakeRegistry([
+        { provider: "vllm", id: "qwen3.8-flash-next", contextWindow: 250_000 },
+        { provider: "anthropic", id: "claude-sonnet-4-6", contextWindow: 200_000 },
+      ]);
+      assert.equal(testApi.contextWindowFor("qwen3.8-flash-next", registry), 250_000);
+      assert.equal(
+        testApi.formatContextUsage(45_000, testApi.contextWindowFor("vllm/qwen3.8-flash-next", registry)),
+        "18.0%/250k",
+      );
+    });
+
+    it("never guesses an ambiguous bare id, but a provider argument resolves it", () => {
+      // Same id under two providers with different windows (the user's real
+      // models.json): bare-id matching must not pick one.
+      const registry = fakeRegistry([
+        { provider: "vllm", id: "qwen3.8-27b", contextWindow: 250_000 },
+        { provider: "llama.cpp", id: "qwen3.8-27b", contextWindow: 32_000 },
+      ]);
+      assert.equal(testApi.contextWindowFor("qwen3.8-27b", registry), undefined);
+      assert.equal(testApi.contextWindowFor("qwen3.8-27b", registry, "llama.cpp"), 32_000);
+      assert.equal(testApi.contextWindowFor("qwen3.8-27b", registry, "vllm"), 250_000);
+      assert.equal(testApi.contextWindowFor("llama.cpp/qwen3.8-27b", registry), 32_000);
+      // Ambiguous + a name-table family falls back to the table, not a registry guess.
+      const ambiguousClaude = fakeRegistry([
+        { provider: "vllm", id: "claude-ish", contextWindow: 400_000 },
+        { provider: "llama.cpp", id: "claude-ish", contextWindow: 8_000 },
+      ]);
+      assert.equal(testApi.contextWindowFor("claude-ish", ambiguousClaude), 200_000);
+    });
+
+    it("matches provider + id exactly, with or without a find() method", () => {
+      const models = [
+        { provider: "vllm", id: "moe-9b", contextWindow: 64_000 },
+        { provider: "llama.cpp", id: "moe-9b", contextWindow: 16_000 },
+      ];
+      assert.equal(testApi.contextWindowFor("llama.cpp/moe-9b", fakeRegistry(models)), 16_000);
+      // A registry that only exposes getAll() must still resolve provider+id.
+      assert.equal(
+        testApi.contextWindowFor("llama.cpp/moe-9b", fakeRegistry(models, { withFind: false })),
+        16_000,
+      );
+      assert.equal(testApi.contextWindowFor("vllm/moe-9b", fakeRegistry(models, { withFind: false })), 64_000);
+      // Unknown provider never matches on id alone.
+      assert.equal(testApi.contextWindowFor("ollama/moe-9b", fakeRegistry(models)), undefined);
+    });
+
+    it("treats a zero or missing registry contextWindow as a miss", () => {
+      const zero = fakeRegistry([{ provider: "vllm", id: "qwen3.8-flash-next", contextWindow: 0 }]);
+      assert.equal(testApi.contextWindowFor("vllm/qwen3.8-flash-next", zero), undefined);
+      assert.equal(testApi.contextWindowFor("qwen3.8-flash-next", zero), undefined);
+      const absent = fakeRegistry([{ provider: "vllm", id: "claude-sonnet-4-6" }]);
+      assert.equal(testApi.contextWindowFor("vllm/claude-sonnet-4-6", absent), 200_000);
+    });
+
+    it("survives a registry that throws or is empty", () => {
+      const boom: any = { getAll: () => { throw new Error("models.json failed to load"); } };
+      assert.equal(testApi.contextWindowFor("claude-sonnet-4-6", boom), 200_000);
+      assert.equal(testApi.contextWindowFor("claude-sonnet-4-6", fakeRegistry([])), 200_000);
+      assert.equal(testApi.contextWindowFor("claude-sonnet-4-6", null), 200_000);
+    });
+
+    it("uses the session_start registry snapshot and stats.provider when rendering", () => {
+      // End-to-end wiring: the subagent_result renderer has no ExtensionContext,
+      // so it reads the ctx captured at session_start (index.ts latestCtx) and
+      // pairs the registry with the provider that summarizeSessionStats recorded
+      // next to the model. Without that pairing an id that exists under two
+      // providers would render with no gauge at all.
+      const handlers = new Map<string, Array<(...args: any[]) => void>>();
+      const renderers: Array<{ name: string; renderer: any }> = [];
+      const api = {
+        on(event: string, handler: (...args: any[]) => void) {
+          if (!handlers.has(event)) handlers.set(event, []);
+          handlers.get(event)!.push(handler);
+        },
+        registerTool() {},
+        registerCommand() {},
+        registerShortcut() {},
+        registerMessageRenderer(name: string, renderer: any) {
+          renderers.push({ name, renderer });
+        },
+        sendUserMessage() {},
+        sendMessage() {},
+        getAllTools() {
+          return [];
+        },
+      } as any;
+      (subagentsModule as any).default(api);
+      const entry = renderers.find((r) => r.name === "subagent_result");
+      assert.ok(entry, "expected the subagent_result renderer to be registered");
+      const emit = (event: string, ...args: any[]) =>
+        (handlers.get(event) ?? []).forEach((h) => h(...args));
+
+      const models = [
+        { provider: "vllm", id: "qwen3.8-27b", contextWindow: 250_000 },
+        { provider: "llama.cpp", id: "qwen3.8-27b", contextWindow: 32_000 },
+      ];
+      const registry = { getAll: () => models, find: (p: string, id: string) => models.find((m) => m.provider === p && m.id === id), getAvailable: () => [] };
+      // hasUI false keeps the widget path a no-op, and the registry is emptied
+      // afterwards so no later test sees this one.
+      const quietCtx: any = { hasUI: false, ui: {}, modelRegistry: fakeRegistry([]), sessionManager: {} };
+      const theme: any = { fg: (_c: string, t: string) => t, bg: (_c: string, t: string) => t, bold: (t: string) => t };
+      const render = (provider: string | null) =>
+        entry
+          .renderer(
+            {
+              role: "user",
+              content: 'Sub-agent "Scout" completed (1m).\n\nDone.',
+              details: {
+                name: "Scout",
+                agent: "scout",
+                exitCode: 0,
+                elapsed: 60_000,
+                stats: {
+                  model: "qwen3.8-27b",
+                  provider,
+                  toolCount: 2,
+                  inputTokens: 100,
+                  outputTokens: 50,
+                  cacheReadTokens: 0,
+                  cacheWriteTokens: 0,
+                  contextTokens: 45_000,
+                  cost: 0.01,
+                },
+              },
+            },
+            { expanded: true },
+            theme,
+          )
+          .render(120)
+          .join("\n");
+
+      try {
+        emit("session_start", {}, { ...quietCtx, modelRegistry: registry });
+        // The provider decides which of the two same-id models the gauge uses.
+        assert.match(render("vllm"), /18\.0%\/250k/);
+        assert.match(render("llama.cpp"), /140\.6%\/32k/);
+        // No provider -> ambiguous bare id -> never guessed: window-less label.
+        assert.match(render(null), /45k ctx/);
+      } finally {
+        emit("session_start", {}, quietCtx);
+      }
     });
   });
 

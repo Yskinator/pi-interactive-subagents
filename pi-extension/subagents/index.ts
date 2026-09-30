@@ -585,12 +585,86 @@ function formatTokens(n: number): string {
   return n < 1000 ? String(n) : n < 10000 ? `${(n / 1000).toFixed(1)}k` : `${Math.round(n / 1000)}k`;
 }
 
+/** The slice of a registry model the gauge needs (structurally compatible with pi's `Model`). */
+type RegistryModelLike = { id: string; provider?: string; contextWindow?: number };
+
 /**
- * Known context-window sizes by model id substring, used for the context-usage
- * gauge. Unknown models fall back to a window-less "Nk ctx" label.
+ * Structural view of pi's `ModelRegistry` — only the synchronous lookups the
+ * gauge uses. Deliberately not `ModelRegistry` itself so tests can pass a fake
+ * and so the render path never depends on the concrete class.
  */
-function contextWindowFor(model: string | null | undefined): number | undefined {
+type ModelRegistryLike = {
+  getAll(): RegistryModelLike[];
+  find?(provider: string, modelId: string): RegistryModelLike | undefined;
+};
+
+function positiveWindow(value: number | undefined): number | undefined {
+  return typeof value === "number" && Number.isFinite(value) && value > 0 ? value : undefined;
+}
+
+/**
+ * Look the model up in the registry. Never guesses:
+ *  - "provider/id" (or a separate provider) is unambiguous, so use the exact
+ *    `find(provider, id)` lookup, falling back to filtering `getAll()`;
+ *  - a bare id is only trusted when EXACTLY one registry model has that id —
+ *    the same id can exist under two providers with different windows (e.g.
+ *    `qwen3.8-27b` under both `vllm` and `llama.cpp`).
+ * Returns undefined for a miss or an ambiguous entry, so the caller can fall
+ * back to the name table.
+ */
+function registryContextWindow(
+  model: string,
+  registry: ModelRegistryLike,
+  provider?: string | null,
+): number | undefined {
+  let all: RegistryModelLike[];
+  try {
+    all = registry.getAll() ?? [];
+  } catch {
+    return undefined;
+  }
+  const slash = model.indexOf("/");
+  const providerPart = slash > 0 ? model.slice(0, slash) : provider ?? undefined;
+  const idPart = slash > 0 ? model.slice(slash + 1) : model;
+
+  if (providerPart) {
+    const found = registry.find ? registry.find(providerPart, idPart) : undefined;
+    const hit =
+      positiveWindow(found?.contextWindow) !== undefined
+        ? found
+        : all.find((m) => m.provider === providerPart && m.id === idPart);
+    return positiveWindow(hit?.contextWindow);
+  }
+
+  const matches = all.filter((m) => m.id === idPart);
+  return matches.length === 1 ? positiveWindow(matches[0].contextWindow) : undefined;
+}
+
+/**
+ * Context-window size for the usage gauge. Resolution order: the model registry
+ * (when supplied) first — a declared `contextWindow` is authoritative for models
+ * the name table cannot guess (vllm/qwen, llama.cpp builds, …) — then the name
+ * table below, then undefined (rendered as a window-less "Nk ctx" label).
+ *
+ * The render path has no `ExtensionContext`, so callers pass the `latestCtx`
+ * snapshot captured at `session_start` — the same ctx-less precedent as the
+ * `agent_model` argument completion. Without a registry the function stays
+ * pure and name-table only.
+ *
+ * CAVEAT: pi's provider-composer defaults a models.json entry that omits
+ * `contextWindow` to 128000, so a registry hit can be a plausible-but-defaulted
+ * number rather than one the user actually declared.
+ */
+function contextWindowFor(
+  model: string | null | undefined,
+  registry?: ModelRegistryLike | null,
+  provider?: string | null,
+): number | undefined {
   if (!model) return undefined;
+  if (registry) {
+    const fromRegistry = registryContextWindow(model, registry, provider);
+    if (fromRegistry !== undefined) return fromRegistry;
+  }
   const m = model.toLowerCase();
   if (m.includes("claude")) return 200_000;
   if (m.includes("gpt-4.1") || m.includes("gpt-4o")) return 128_000;
@@ -3536,7 +3610,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (stats) {
           const segs = formatUsageSegments(stats).map((s) => theme.fg("dim", s));
           if (stats.contextTokens > 0) {
-            const window = contextWindowFor(stats.model);
+            // No ExtensionContext here — use the session_start snapshot for the
+            // registry lookup (same ctx-less precedent as listModelRefs). The
+            // session entry stores provider next to model, so pass it through:
+            // stats.model is a bare id and bare ids can be ambiguous.
+            const window = contextWindowFor(stats.model, latestCtx?.modelRegistry, stats.provider);
             const ctxStr = formatContextUsage(stats.contextTokens, window);
             const pct = window ? (stats.contextTokens / window) * 100 : 0;
             const coloredCtx =
