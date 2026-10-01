@@ -974,8 +974,10 @@ function truncateChainOutput(text: string, cap: number): string {
  *
  * Chain steps used to receive zero chain context: step 1 had no idea it was
  * part of a sequence. So the block reports where the step sits in the chain, its
- * own role, the full sequence, and the automatic hand-off — later steps run on
- * their own and receive this step's final message. It ends with one practical
+ * own role, the full sequence, and the automatic hand-off — any earlier steps
+ * have already run and any later steps run on their own and receive this step's
+ * final message. Both clauses are conditional on purpose: step 1 has no earlier
+ * peers and the last step has no later ones. It ends with one practical
  * consequence of that hand-off: the orchestrator that started the chain sees
  * only the final step's final message, so a step carries forward whatever it got
  * from earlier steps that the orchestrator should know about.
@@ -1002,7 +1004,7 @@ export function buildChainContextBlock(info: {
     ``,
     `You are step ${info.stepIndex} of ${info.stepTotal} in the sub-agent chain \`${info.chainName}\`.`,
     `Your agent role is \`${agent}\`; the chain sequence is \`${sequence}\`.`,
-    `Earlier steps have already run; later steps run automatically after you and receive your final message.`,
+    `Any earlier steps have already run; any later steps run automatically after you and receive your final message.`,
     `The orchestrator that started this chain sees only the final step's final message, so pass along anything the orchestrator should know from earlier steps.`,
   ].join("\n");
 }

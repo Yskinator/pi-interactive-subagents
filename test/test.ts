@@ -2815,9 +2815,10 @@ describe("subagent chain", () => {
   });
 
   // ── buildChainContextBlock: the step's position, as a system-prompt block ──
-  // Descriptive: the block names the chain, its other steps, the fact that later
-  // steps run on their own, and one consequence of that hand-off (only the last
-  // step's final message reaches the orchestrator). It never restricts spawning.
+  // Descriptive: the block names the chain, its other steps, the fact that any
+  // later steps run on their own, and one consequence of that hand-off (only the
+  // last step's final message reaches the orchestrator). It never restricts
+  // spawning.
 
   it("tells a chain step its position, role, and the full chain sequence", () => {
     const block = testApi.buildChainContextBlock({
@@ -2831,11 +2832,16 @@ describe("subagent chain", () => {
     assert.match(block, /step 2 of 3 in the sub-agent chain `fix-auth`/, "position within the chain");
     assert.match(block, /agent role is `reviewer`/, "its own role");
     assert.match(block, /chain sequence is `worker → reviewer → worker`/, "the whole sequence");
-    assert.match(block, /Earlier steps have already run/, "earlier steps ran");
+    // Both clauses of the hand-off line are qualified with "any". The same
+    // sentence is emitted for step 1 (no earlier steps exist) and for the last
+    // step (no later steps exist), so it must not read as asserting that such
+    // peers are always there on both sides.
+    assert.ok(block.length > 0, "the block must not be empty — a blank block must fail every match below");
+    assert.match(block, /Any earlier steps have already run/, "earlier steps ran, if the chain has any");
     assert.match(
       block,
-      /later steps run automatically after you and receive your final message/,
-      "later steps run on their own and get this step's output",
+      /any later steps run automatically after you and receive your final message/,
+      "later steps run on their own and get this step's output, if the chain has any",
     );
     assert.match(
       block,
@@ -2895,10 +2901,19 @@ describe("subagent chain", () => {
       /so pass along anything the orchestrator should know from earlier steps/,
       "earlier-step information is carried forward",
     );
+    // This is step 1, which has no earlier steps at all. The hand-off sentence is
+    // emitted identically for every step, so both clauses stay conditional ("any
+    // earlier", "any later") instead of claiming peers on both sides.
+    assert.ok(block.length > 0, "the block must not be empty — a blank block must fail every match below");
     assert.match(
       block,
-      /later steps run automatically after you and receive your final message/,
-      "later steps run on their own and get this step's output",
+      /Any earlier steps have already run/,
+      "earlier steps ran, if the chain has any (step 1 has none)",
+    );
+    assert.match(
+      block,
+      /any later steps run automatically after you and receive your final message/,
+      "later steps run on their own and get this step's output, if the chain has any",
     );
     assert.ok(block.includes("worker") && block.includes("reviewer"), "peers are named");
     // Exactly the six emitted lines: heading, blank line, then four fact lines.
