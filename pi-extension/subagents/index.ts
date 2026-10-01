@@ -41,6 +41,7 @@ import {
   summarizeSessionStats,
   writeSubagentLoadout,
   type SessionStats,
+  type SubagentChainContext,
   type SubagentLoadout,
 } from "./session.ts";
 import { registerAgentModelCommand } from "./agent-model-command.ts";
@@ -968,6 +969,129 @@ function truncateChainOutput(text: string, cap: number): string {
   return `${text.slice(0, cap)}\n\n[truncated — ${omitted} more characters; full output in the step's session file]`;
 }
 
+/**
+ * The `## Chain context` block injected into a chain step's system prompt.
+ *
+ * Chain steps used to receive zero chain context: step 1 had no idea it was
+ * part of a sequence. So the block reports where the step sits in the chain, its
+ * own role, the full sequence, and the automatic hand-off — later steps run on
+ * their own and receive this step's final message. It ends with one practical
+ * consequence of that hand-off: the orchestrator that started the chain sees
+ * only the final step's final message, so a step carries forward whatever it got
+ * from earlier steps that the orchestrator should know about.
+ *
+ * DESCRIPTIVE by design: apart from that single consequence, the block carries
+ * no prohibitions and no spawn restrictions of any kind. A step infers what to
+ * do from knowing who its peers are. Nothing in this feature limits what a step
+ * may spawn: the PI_SUBAGENT_ALLOWED allowlist and the spawn paths are
+ * untouched. Returns "" for a single-step chain: one step is not a chain, so it
+ * gets no extra noise.
+ */
+export function buildChainContextBlock(info: {
+  chainName: string;
+  stepIndex: number;
+  stepTotal: number;
+  agent: string;
+  sequence: string;
+}): string {
+  if (!info || info.stepTotal < 2) return "";
+  const agent = info.agent?.trim() || "subagent";
+  const sequence = info.sequence?.trim() || agent;
+  return [
+    `## Chain context`,
+    ``,
+    `You are step ${info.stepIndex} of ${info.stepTotal} in the sub-agent chain \`${info.chainName}\`.`,
+    `Your agent role is \`${agent}\`; the chain sequence is \`${sequence}\`.`,
+    `Earlier steps have already run; later steps run automatically after you and receive your final message.`,
+    `The orchestrator that started this chain sees only the final step's final message, so pass along anything the orchestrator should know from earlier steps.`,
+  ].join("\n");
+}
+
+/**
+ * Sanitize a persisted chain step number. At resume these come straight from the
+ * on-disk `.loadout.json` snapshot, and they are emitted into a shell command
+ * line, so they must never be able to carry text through — anything that is not
+ * a positive integer collapses to 0, which the caller reads as "not a chain
+ * step".
+ */
+function chainStepNumber(value: unknown): number {
+  const n = Math.trunc(Number(value));
+  return Number.isSafeInteger(n) && n > 0 ? n : 0;
+}
+
+/**
+ * The single validity gate for a chain position, shared by every channel that
+ * reports it — the system-prompt block, the PI_SUBAGENT_CHAIN_* env vars, and
+ * the widget. Numbers are sanitized (at resume they arrive straight from an
+ * on-disk `.loadout.json`, where they may be text), and anything that is not a
+ * real position in a chain of two or more steps yields null, which every caller
+ * reads as "not a chain step". Without one shared gate the three channels could
+ * disagree about the very question of whether a launch was a chain step at all.
+ */
+function normalizeChain(
+  chain: SubagentChainContext | null | undefined,
+): { chainName: string; stepIndex: number; stepTotal: number; sequence: string } | null {
+  if (!chain) return null;
+  const stepIndex = chainStepNumber(chain.stepIndex);
+  const stepTotal = chainStepNumber(chain.stepTotal);
+  if (stepTotal < 2 || stepIndex < 1) return null;
+  return {
+    chainName: String(chain.chainName ?? ""),
+    stepIndex,
+    stepTotal,
+    sequence: String(chain.sequence ?? ""),
+  };
+}
+
+/**
+ * The PI_SUBAGENT_CHAIN_* env prefix for a chain step (empty for ordinary
+ * spawns). Shared by the launch and resume paths so the two can never drift.
+ * Strings follow the shellEscape convention of the other PI_SUBAGENT_* vars;
+ * the two numbers are sanitized integers, so they need no quoting.
+ */
+function buildChainEnvParts(chain: SubagentChainContext | null | undefined): string[] {
+  const c = normalizeChain(chain);
+  if (!c) return [];
+  return [
+    `PI_SUBAGENT_CHAIN_NAME=${shellEscape(c.chainName)}`,
+    `PI_SUBAGENT_CHAIN_STEP=${c.stepIndex}`,
+    `PI_SUBAGENT_CHAIN_STEP_TOTAL=${c.stepTotal}`,
+    `PI_SUBAGENT_CHAIN_SEQUENCE=${shellEscape(c.sequence)}`,
+  ];
+}
+
+/** The chain block for a persisted loadout — identical text at launch and resume. */
+function chainBlockForLoadout(loadout: SubagentLoadout): string {
+  const c = normalizeChain(loadout.chain);
+  if (!c) return "";
+  return buildChainContextBlock({ ...c, agent: loadout.agent ?? "" });
+}
+
+/**
+ * The widget fields for a chain position, via the same gate as the block and
+ * the env vars. Crucial on the resume path, where these come from disk: raw
+ * on-disk text must never reach renderSubagentWidgetLines(), which interpolates
+ * them straight into a TUI line (and a corrupt snapshot would otherwise also
+ * make the widget disagree with a block and env vars that correctly opted out).
+ */
+function chainWidgetPosition(
+  chain: SubagentChainContext | null | undefined,
+): { chainStep?: number; chainStepTotal?: number } {
+  const c = normalizeChain(chain);
+  return c ? { chainStep: c.stepIndex, chainStepTotal: c.stepTotal } : {};
+}
+
+/**
+ * The pieces of one system prompt, joined into the SINGLE value handed to one
+ * --append-system-prompt / --system-prompt flag: the agent identity (when it
+ * lives in the system prompt) followed by the chain-context block. Both the pi
+ * path (via applySandboxToParts) and the Claude CLI path compose here, which is
+ * what keeps the block from ever being delivered by two separate calls.
+ */
+function composeSystemPromptText(identity: string | null | undefined, chainBlock: string): string {
+  return [identity, chainBlock].filter((part) => typeof part === "string" && part.trim().length > 0).join("\n\n");
+}
+
 /** The `details.steps` payload shared by the steer message and the renderer. */
 function chainStepDetails(steps: ChainStepRecord[]): Array<Record<string, unknown>> {
   return steps.map((s) => ({
@@ -1052,6 +1176,12 @@ type ChainStepRunner = (
     onLaunched: (running: RunningSubagent) => void;
     onSurfaceLost: () => void;
   },
+  /**
+   * Where this step sits in the chain, so the step can be told (system prompt +
+   * PI_SUBAGENT_CHAIN_* env). Optional so a stubbed runner — and any non-chain
+   * launch — stays unaffected.
+   */
+  chainContext?: SubagentChainContext,
 ) => Promise<ChainStepRunResult>;
 
 /** Launch/watch behind a seam so the real runStep can be unit-tested
@@ -1067,7 +1197,7 @@ const subagentOps: { launch: typeof launchSubagent; watch: typeof watchSubagent 
  * (spawning real tmux panes is integration-test territory).
  */
 const chainHooks: { runStep: ChainStepRunner } = {
-  runStep: async (step, ctx, parentArtifactDir, pi, signal, { onLaunched, onSurfaceLost }) => {
+  runStep: async (step, ctx, parentArtifactDir, pi, signal, { onLaunched, onSurfaceLost }, chainContext) => {
     const running = await subagentOps.launch(
       {
         agent: step.agent,
@@ -1077,6 +1207,7 @@ const chainHooks: { runStep: ChainStepRunner } = {
         ...(step.cwd ? { cwd: step.cwd } : {}),
       },
       ctx,
+      chainContext ? { chainContext } : undefined,
     );
     // The previous step's completion cleared the refresh timers while
     // runningSubagents was empty; without re-arming them, this step's row
@@ -1121,6 +1252,9 @@ async function runChain(
   pi: ExtensionAPI,
 ): Promise<void> {
   let previous: { agent: string; stepIndex: number; output: string } | null = null;
+  // The chain's agent roles in order — what every step is told the sequence is,
+  // and what gets persisted in its loadout for a faithful resume.
+  const sequence = chain.steps.map((s) => s.agent).join(" → ");
 
   for (const step of chain.steps) {
     if (chain.aborted || chain.abortController.signal.aborted) {
@@ -1143,6 +1277,12 @@ async function runChain(
 
     try {
       const taskForStep = buildChainStepTask(step.task, previous);
+      // A single-step chain is not a chain: no context is threaded, so the step
+      // launches exactly like an ordinary spawn (no block, no env vars).
+      const chainContext: SubagentChainContext | undefined =
+        chain.steps.length >= 2
+          ? { chainName: chain.name, stepIndex: step.index, stepTotal: chain.steps.length, sequence }
+          : undefined;
       const result = await chainHooks.runStep(
         {
           agent: step.agent,
@@ -1158,14 +1298,17 @@ async function runChain(
         {
           onLaunched: (running) => {
             chain.currentRunning = running;
-            running.chainStep = step.index;
-            running.chainStepTotal = chain.steps.length;
+            // Widget position — chainWidgetPosition opts out (assigns nothing)
+            // for a one-step chain, matching what the resume path derives from a
+            // persisted one-step loadout.
+            Object.assign(running, chainWidgetPosition(chainContext));
           },
           onSurfaceLost: () => {
             chain.surfaceLost = true;
             chain.abortController.abort();
           },
         },
+        chainContext,
       );
 
       step.name = result.name;
@@ -1598,8 +1741,11 @@ function buildSubagentToolAllowlist(
  * This is the single source of truth for reconstructing a subagent's sandbox,
  * used both by the initial `launchSubagent` and by the `subagent_message`
  * resume path so the two can never drift. Env vars (PI_SUBAGENT_AGENT /
- * PI_SUBAGENT_ALLOWED / PI_CODING_AGENT_DIR) and cwd are the caller's
- * responsibility since they differ slightly between launch and resume.
+ * PI_SUBAGENT_ALLOWED / PI_CODING_AGENT_DIR / PI_SUBAGENT_CHAIN_*) and cwd are
+ * the caller's responsibility since they differ slightly between launch and
+ * resume. The chain-context system-prompt block is NOT: it rides on the
+ * loadout's persisted chain position so every launch mode injects it exactly
+ * once through the same channel used for the agent identity.
  */
 function applySandboxToParts(
   parts: string[],
@@ -1611,19 +1757,38 @@ function applySandboxToParts(
     parts.push("--model", shellEscape(model));
   }
 
-  if (loadout.identity) {
-    const flag = loadout.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
-    const spTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const spSafeName = opts.name
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "")
-      .replace(/\s+/g, "-")
-      .replace(/-+/g, "-")
-      .replace(/^-|-$/g, "");
-    const spPath = join(opts.artifactDir, `context/${spSafeName || "subagent"}-sysprompt-${spTimestamp}.md`);
-    mkdirSync(dirname(spPath), { recursive: true });
-    writeFileSync(spPath, loadout.identity, "utf8");
-    parts.push(flag, shellEscape(spPath));
+  const promptFileSuffix = (opts.name ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "")
+    .replace(/\s+/g, "-")
+    .replace(/-+/g, "-")
+    .replace(/^-|-$/g, "");
+  const writePromptFile = (kind: string, text: string): string => {
+    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+    const path = join(opts.artifactDir, `context/${promptFileSuffix || "subagent"}-${kind}-${stamp}.md`);
+    mkdirSync(dirname(path), { recursive: true });
+    writeFileSync(path, text, "utf8");
+    return path;
+  };
+
+  // Chain position block (chain steps only). It rides on the identity's own
+  // system-prompt call: when an identity exists it is appended to that text so
+  // the block and the identity travel in ONE call — pushing a second
+  // --append-system-prompt as well would risk double delivery — and when there
+  // is no identity to carry it (agentless/fork spawns, agents without
+  // `system-prompt:` frontmatter whose identity went into the task's roleBlock
+  // instead) it is delivered on its own. Either way exactly one call, in every
+  // launch mode, never in the task text.
+  const chainBlock = chainBlockForLoadout(loadout);
+  // Guard on the COMPOSED text, not on the raw fields: a truthy-but-blank
+  // identity must not cause an empty prompt file to be written and passed.
+  const identity = loadout.identity?.trim() ? loadout.identity : "";
+  const promptText = composeSystemPromptText(identity, chainBlock);
+  if (promptText) {
+    // Only a real identity may replace the system prompt; a block-only delivery
+    // always appends, so it can never drop pi's own prompt.
+    const flag = identity && loadout.systemPromptMode === "replace" ? "--system-prompt" : "--append-system-prompt";
+    parts.push(flag, shellEscape(writePromptFile(identity ? "sysprompt" : "chain-context", promptText)));
   }
 
   // Default-deny: disable global extension discovery and re-enable only the
@@ -1679,10 +1844,16 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
   const read: ActivityReadResult = activityFile
     ? readSubagentActivityFile(activityFile, running.id)
     : { ok: false, reason: "missing" };
+  // Pre-existing typing quirk: the negative side of this union does not narrow
+  // under the project's non-strict tsconfig, so spell the failure side out once
+  // instead of reading read.reason/read.error off the un-narrowed union.
+  const readFailure: Extract<ActivityReadResult, { ok: false }> | null = read.ok
+    ? null
+    : (read as Extract<ActivityReadResult, { ok: false }>);
 
-  running.activityRead = read.ok
-    ? { ok: true }
-    : { ok: false, reason: read.reason, error: read.error };
+  running.activityRead = readFailure
+    ? { ok: false, reason: readFailure.reason, error: readFailure.error }
+    : { ok: true };
 
   if (read.ok) {
     running.activity = read.activity;
@@ -1702,8 +1873,8 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
   }
 
   running.statusState = observeStatus(running.statusState, {
-    snapshot: read.reason,
-    snapshotError: read.error,
+    snapshot: readFailure?.reason,
+    snapshotError: readFailure?.error,
   }, observedAt);
 }
 
@@ -2017,6 +2188,13 @@ export const __test__ = {
   widgetIcon,
   // Chain internals (unit-test hooks)
   buildChainStepTask,
+  buildChainContextBlock,
+  buildChainEnvParts,
+  composeSystemPromptText,
+  chainStepNumber,
+  chainBlockForLoadout,
+  chainWidgetPosition,
+  normalizeChain,
   chainHooks,
   subagentOps,
   formatChainPresentation,
@@ -2075,7 +2253,7 @@ function startWidgetRefresh() {
 async function launchSubagent(
   params: typeof SubagentParams.static,
   ctx: { sessionManager: { getSessionFile(): string | null; getSessionId(): string; getSessionDir(): string }; cwd: string },
-  options?: { surface?: string },
+  options?: { surface?: string; chainContext?: SubagentChainContext },
 ): Promise<RunningSubagent> {
   const startTime = Date.now();
   const id = Math.random().toString(16).slice(2, 10);
@@ -2157,6 +2335,15 @@ async function launchSubagent(
   const fullTask = inheritsConversationContext
     ? params.task
     : `${roleBlock}\n\n${modeHint}\n\n${params.task}\n\n${summaryInstruction}`;
+
+  // Chain position of this launch — undefined for ordinary spawns and for a
+  // one-step chain. Advisory only: nothing about it restricts what the step may
+  // spawn. It reaches the child two ways: the PI_SUBAGENT_CHAIN_* env vars
+  // below, and the `## Chain context` block in its SYSTEM PROMPT — never in the
+  // task text, because fullTask is bypassed entirely in fork mode (params.task
+  // goes through verbatim) and delivered as an artifact file otherwise.
+  const chainContext = options?.chainContext;
+
   // ── Claude Code CLI path ──
   if (agentDefs?.cli === "claude") {
     const sentinelFile = `/tmp/pi-claude-${id}-done`;
@@ -2164,6 +2351,12 @@ async function launchSubagent(
 
     const cmdParts: string[] = [];
     cmdParts.push(`PI_CLAUDE_SENTINEL=${shellEscape(sentinelFile)}`);
+    // Chain position, machine-readable — the twin of the block below. This path
+    // sets no other PI_SUBAGENT_* var (it never persists a loadout, so there is
+    // no sandbox to replay), but a `cli: claude` chain step must still get the
+    // env channel a pi chain step gets. buildChainEnvParts returns [] for a
+    // non-chain launch, so an ordinary Claude spawn is byte-identical to before.
+    cmdParts.push(...buildChainEnvParts(chainContext));
     cmdParts.push("claude");
     cmdParts.push("--dangerously-skip-permissions");
 
@@ -2175,7 +2368,15 @@ async function launchSubagent(
       cmdParts.push("--model", shellEscape(effectiveModel));
     }
 
-    const sp = agentDefs.body;
+    // Claude CLI path: one --append-system-prompt call, carrying the identity
+    // with the chain block appended (there is no shared loadout helper here —
+    // this path never persists a loadout). normalizeChain keeps this branch on
+    // the same validity gate as the pi path.
+    const normalized = normalizeChain(chainContext);
+    const chainBlock = normalized
+      ? buildChainContextBlock({ ...normalized, agent: params.agent ?? "" })
+      : "";
+    const sp = composeSystemPromptText(agentDefs.body, chainBlock);
     if (sp) {
       cmdParts.push("--append-system-prompt", shellEscape(sp));
     }
@@ -2269,6 +2470,9 @@ async function launchSubagent(
     cwd: effectiveCwd ?? null,
     agentDir: resolvedAgentDir,
     modelOverrides: Object.keys(modelOverrides).length > 0 ? modelOverrides : null,
+    // Persisted so a resume rebuilds the same block and replays the same
+    // position; the block itself is injected by applySandboxToParts().
+    chain: chainContext ?? null,
   };
   writeSubagentLoadout(subagentSessionFile, loadout);
 
@@ -2300,6 +2504,14 @@ async function launchSubagent(
   envParts.push(`PI_SUBAGENT_ID=${shellEscape(id)}`);
   envParts.push(`PI_SUBAGENT_ACTIVITY_FILE=${shellEscape(activityFile)}`);
   envParts.push(`PI_SUBAGENT_SURFACE=${shellEscape(surface)}`);
+  // Chain position (chain steps only) — the machine-readable twin of the
+  // system-prompt block. Deliberately absent (never set to "") for non-chain
+  // launches, and that is safe in both directions: these are per-command `VAR=x
+  // cmd` assignments scoped to this one process, and the pane itself is created
+  // by `tmux split-window`, whose shell inherits the tmux *server* environment,
+  // not the spawner's. So a chain step's own child spawn can neither inherit a
+  // stale PI_SUBAGENT_CHAIN_* nor see one it was never given.
+  envParts.push(...buildChainEnvParts(chainContext));
   const envPrefix = envParts.join(" ") + " ";
 
   // Pass task and skill prompts to the sub-agent.
@@ -3001,7 +3213,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback (shouldn't happen)
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        const fallbackText = result.content[0] as { text?: string } | undefined;
+        const text = typeof fallbackText?.text === "string" ? fallbackText.text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
     });
@@ -3124,7 +3337,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // Fallback / error
-        const text = typeof result.content[0]?.text === "string" ? result.content[0].text : "";
+        const fallbackText = result.content[0] as { text?: string } | undefined;
+        const text = typeof fallbackText?.text === "string" ? fallbackText.text : "";
         return new Text(theme.fg("dim", text), 0, 0);
       },
 
@@ -3317,6 +3531,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         if (autoExit) {
           resumeEnvParts.push(`PI_SUBAGENT_AUTO_EXIT=1`);
         }
+        // Replay the snapshot's chain position (chain steps only) so the resumed
+        // step is told — and can read — the position it originally had, never a
+        // recomputed one. The system-prompt block itself comes from
+        // applySandboxToParts() above, off the same loadout field.
+        resumeEnvParts.push(...buildChainEnvParts(loadout.chain));
         const resumeEnvPrefix = resumeEnvParts.join(" ") + " ";
 
         // Resume in the subagent's original cwd so its tools (safe_bash, edits)
@@ -3356,6 +3575,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           launchScriptFile,
           activityFile,
           interactive,
+          // Widget: a resumed chain step keeps the position it ran with — the
+          // same sanitized numbers (and the same opt-out gate) as its block and
+          // its env vars, so nothing from the snapshot reaches the TUI unfiltered.
+          ...chainWidgetPosition(loadout.chain),
           statusState: createStatusState({
             source: "pi",
             startTimeMs: startTime,
@@ -3497,6 +3720,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const icon = failed ? theme.fg("error", "✗") : theme.fg("success", "✓");
 
       return {
+        // pi's Component contract — render() is pure here, so there is no
+        // cached output to drop.
+        invalidate(): void {},
         render(width: number): string[] {
           const stepStatusText = (s: any): string =>
             s.status === "completed"
@@ -3577,6 +3803,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     }
 
     return {
+      invalidate(): void {},
       render(width: number): string[] {
         const name = details.name ?? "subagent";
         const exitCode = details.exitCode ?? 0;
@@ -3694,6 +3921,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (lines.length === 0 && overflow === 0) return undefined;
 
     return {
+      invalidate(): void {},
       render(width: number): string[] {
         const lineWidth = Math.max(0, width - 6);
         const contentLines = [
@@ -3721,6 +3949,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     if (!details) return undefined;
 
     return {
+      invalidate(): void {},
       render(width: number): string[] {
         const name = details.name ?? "subagent";
         const agentTag = details.agent ? theme.fg("dim", ` (${details.agent})`) : "";

@@ -81,6 +81,25 @@ export function seedSubagentSessionFile(params: {
 }
 
 /**
+ * Where a subagent sat inside a sub-agent chain, as resolved at launch.
+ *
+ * Persisted in the loadout so a resumed chain step is told the position it
+ * originally had (step 2 of 3 stays step 2 of 3) instead of having a position
+ * recomputed from a chain that has long since finished. Absent for ordinary
+ * single spawns and for single-step "chains".
+ */
+export interface SubagentChainContext {
+  /** Chain display name, e.g. "fix-auth". */
+  chainName: string;
+  /** 1-based index of this step within the chain. */
+  stepIndex: number;
+  /** Total number of steps in the chain. */
+  stepTotal: number;
+  /** The chain's agent roles in order, e.g. "worker → reviewer → worker". */
+  sequence: string;
+}
+
+/**
  * A snapshot of everything needed to reconstruct a subagent's sandbox when its
  * session is later resumed via `subagent_message({ sessionId })`.
  *
@@ -124,6 +143,15 @@ export interface SubagentLoadout {
    * simply lack it; treat undefined as empty.
    */
   modelOverrides?: Record<string, string> | null;
+  /**
+   * Chain position when this subagent was launched as a chain step, or null /
+   * absent for ordinary spawns. Resume replays it as the PI_SUBAGENT_CHAIN_*
+   * env vars and re-injects the same `## Chain context` system-prompt block, so
+   * the reincarnated step sees the position it originally had. Loadouts written
+   * before this field existed simply lack it — treat undefined as "not a chain
+   * step".
+   */
+  chain?: SubagentChainContext | null;
 }
 
 /** Path of the loadout sidecar written next to a subagent session file. */

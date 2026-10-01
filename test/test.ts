@@ -2814,6 +2814,407 @@ describe("subagent chain", () => {
     assert.equal(task, "next step");
   });
 
+  // ── buildChainContextBlock: the step's position, as a system-prompt block ──
+  // Descriptive: the block names the chain, its other steps, the fact that later
+  // steps run on their own, and one consequence of that hand-off (only the last
+  // step's final message reaches the orchestrator). It never restricts spawning.
+
+  it("tells a chain step its position, role, and the full chain sequence", () => {
+    const block = testApi.buildChainContextBlock({
+      chainName: "fix-auth",
+      stepIndex: 2,
+      stepTotal: 3,
+      agent: "reviewer",
+      sequence: "worker → reviewer → worker",
+    });
+    assert.ok(block.startsWith("## Chain context\n"), "heading comes first");
+    assert.match(block, /step 2 of 3 in the sub-agent chain `fix-auth`/, "position within the chain");
+    assert.match(block, /agent role is `reviewer`/, "its own role");
+    assert.match(block, /chain sequence is `worker → reviewer → worker`/, "the whole sequence");
+    assert.match(block, /Earlier steps have already run/, "earlier steps ran");
+    assert.match(
+      block,
+      /later steps run automatically after you and receive your final message/,
+      "later steps run on their own and get this step's output",
+    );
+    assert.match(
+      block,
+      /sees only the final step's final message, so pass along anything the orchestrator should know from earlier steps/,
+      "the orchestrator only sees the last step's final message",
+    );
+    assert.ok(block.includes("worker") && block.includes("reviewer"), "peers are named");
+    // Rides along in a system prompt: no trailing whitespace, no blank runs.
+    assert.equal(block, block.trimEnd(), "no trailing whitespace");
+    assert.ok(!block.includes("\n\n\n"), "no double blank lines");
+  });
+
+  it("states the chain facts without any prohibitive or enforcement wording", () => {
+    const block = testApi.buildChainContextBlock({
+      chainName: "fix-auth",
+      stepIndex: 1,
+      stepTotal: 3,
+      agent: "worker",
+      sequence: "worker → reviewer → worker",
+    });
+    // The block is information about where the step sits, what happens next, and
+    // one consequence of the hand-off — never an instruction, a prohibition, or a
+    // spawning restriction. The list below still guards against that wording even
+    // though the block now carries the practical-consequence line: the line states
+    // what the orchestrator sees and what carrying forward means, without ever
+    // telling a step what it may or may not do.
+    const lower = block.toLowerCase();
+    for (const banned of [
+      "do not",
+      "don't",
+      "never",
+      "avoid",
+      "instead",
+      "spawn a",
+      "unless",
+      "forbidden",
+      "restricted",
+      "allowlist",
+      "whitelist",
+      "pi_subagent_allowed",
+      "subagent_agents",
+    ]) {
+      assert.ok(!lower.includes(banned), `the block must stay factual (found ${JSON.stringify(banned)})`);
+    }
+    // Not vacuous: every fact a step needs is still there — position, sequence,
+    // the automatic hand-off, who sees the final message, and its peers by name.
+    assert.match(block, /step 1 of 3 in the sub-agent chain `fix-auth`/, "position within the chain");
+    assert.match(block, /agent role is `worker`/, "its own role");
+    assert.match(block, /chain sequence is `worker → reviewer → worker`/, "the whole sequence");
+    assert.match(
+      block,
+      /The orchestrator that started this chain sees only the final step's final message/,
+      "the orchestrator only sees the last step's final message",
+    );
+    assert.match(
+      block,
+      /so pass along anything the orchestrator should know from earlier steps/,
+      "earlier-step information is carried forward",
+    );
+    assert.match(
+      block,
+      /later steps run automatically after you and receive your final message/,
+      "later steps run on their own and get this step's output",
+    );
+    assert.ok(block.includes("worker") && block.includes("reviewer"), "peers are named");
+    // Exactly the six emitted lines: heading, blank line, then four fact lines.
+    const lines = block.split("\n");
+    assert.equal(lines.length, 6, "heading, blank line, then the four fact lines and nothing more");
+    assert.equal(lines[0], "## Chain context");
+    assert.equal(lines[1], "");
+    assert.ok(lines.every((line) => line === line.trimEnd()), "no trailing whitespace");
+  });
+
+  it("falls back to a generic role label when agent and sequence are blank", () => {
+    const block = testApi.buildChainContextBlock({
+      chainName: "c",
+      stepIndex: 1,
+      stepTotal: 2,
+      agent: "   ",
+      sequence: "  ",
+    });
+    assert.match(block, /agent role is `subagent`/);
+    assert.match(block, /chain sequence is `subagent`/);
+  });
+
+  it("returns an empty block when there is no chain to describe", () => {
+    // A one-step chain is not a chain — the step must launch exactly like an
+    // ordinary spawn, with no extra prompt noise.
+    assert.equal(
+      testApi.buildChainContextBlock({ chainName: "c", stepIndex: 1, stepTotal: 1, agent: "worker", sequence: "worker" }),
+      "",
+    );
+    assert.equal(
+      testApi.buildChainContextBlock({ chainName: "c", stepIndex: 0, stepTotal: 0, agent: "worker", sequence: "" }),
+      "",
+    );
+  });
+
+  it("emits the PI_SUBAGENT_CHAIN_* vars for chain steps only", () => {
+    assert.deepEqual(
+      testApi.buildChainEnvParts({
+        chainName: "fix auth",
+        stepIndex: 2,
+        stepTotal: 3,
+        sequence: "worker → reviewer",
+      }),
+      [
+        `PI_SUBAGENT_CHAIN_NAME=${shellEscape("fix auth")}`,
+        "PI_SUBAGENT_CHAIN_STEP=2",
+        "PI_SUBAGENT_CHAIN_STEP_TOTAL=3",
+        `PI_SUBAGENT_CHAIN_SEQUENCE=${shellEscape("worker → reviewer")}`,
+      ],
+      "name, 1-based step, total, and sequence — quoted like every other PI_SUBAGENT_* var",
+    );
+    // Ordinary spawns and one-step chains get none at all.
+    assert.deepEqual(testApi.buildChainEnvParts(undefined), []);
+    assert.deepEqual(testApi.buildChainEnvParts(null), []);
+    assert.deepEqual(
+      testApi.buildChainEnvParts({ chainName: "c", stepIndex: 1, stepTotal: 1, sequence: "worker" }),
+      [],
+    );
+  });
+
+  // ── Exactly-once delivery into the child's system prompt ──
+
+  /** Resolve the file a --append-system-prompt/--system-prompt flag points at. */
+  function promptFileArg(parts: string[], flag: string): string {
+    const i = parts.indexOf(flag);
+    assert.ok(i >= 0, `expected ${flag} in ${parts.join(" ")}`);
+    return parts[i + 1].replace(/^'/, "").replace(/'$/, "").replace(/'\\''/g, "'");
+  }
+
+  const unrestrictedLoadout = {
+    toolAllowlist: null,
+    model: null,
+    thinking: null,
+    spawnable: null,
+    autoExit: true,
+    cwd: null,
+    agentDir: null,
+    modelOverrides: null,
+  };
+  const stepTwo = { chainName: "fix-auth", stepIndex: 2, stepTotal: 3, sequence: "worker → reviewer → worker" };
+
+  it("rides the block on the identity's single system-prompt call", () => {
+    withTempDir((d) => {
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        { ...unrestrictedLoadout, agent: "worker", systemPromptMode: "append", identity: "You are a worker.", chain: stepTwo },
+        { artifactDir: d, name: "worker" },
+      );
+      assert.equal(parts.filter((p) => p === "--append-system-prompt").length, 1, "exactly one system-prompt call");
+      assert.equal(parts.filter((p) => p === "--system-prompt").length, 0);
+      const written = readFileSync(promptFileArg(parts, "--append-system-prompt"), "utf8");
+      assert.ok(written.includes("You are a worker."), "identity still arrives");
+      assert.ok(written.includes("## Chain context"), "block arrives with it");
+      assert.ok(written.includes("step 2 of 3"), "with the position");
+    });
+  });
+
+  it("delivers the block on its own when the identity went into the task instead", () => {
+    withTempDir((d) => {
+      // No `system-prompt:` frontmatter → the loadout carries no identity (it
+      // lived in the task's roleBlock), so the block must still reach the
+      // system prompt — as the only system-prompt call.
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        { ...unrestrictedLoadout, agent: "worker", systemPromptMode: null, identity: null, chain: stepTwo },
+        { artifactDir: d, name: "worker" },
+      );
+      assert.equal(parts.filter((p) => p === "--append-system-prompt").length, 1);
+      const written = readFileSync(promptFileArg(parts, "--append-system-prompt"), "utf8");
+      assert.ok(written.startsWith("## Chain context"), "block only — no identity text in it");
+      assert.ok(!written.includes("You are a worker."));
+    });
+  });
+
+  it("delivers the block for an agentless (fork) launch too", () => {
+    withTempDir((d) => {
+      // inheritsConversationContext mode passes params.task through verbatim, so
+      // the task text is no injection point at all — the append channel is.
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        { ...unrestrictedLoadout, agent: null, systemPromptMode: null, identity: null, chain: stepTwo },
+        { artifactDir: d, name: "fork" },
+      );
+      assert.equal(parts.filter((p) => p === "--append-system-prompt").length, 1);
+      assert.ok(readFileSync(promptFileArg(parts, "--append-system-prompt"), "utf8").includes("step 2 of 3"));
+    });
+  });
+
+  it("adds nothing at all to a non-chain launch", () => {
+    withTempDir((d) => {
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        { ...unrestrictedLoadout, agent: "worker", systemPromptMode: "append", identity: "You are a worker." },
+        { artifactDir: d, name: "worker" },
+      );
+      assert.equal(parts.filter((p) => p === "--append-system-prompt").length, 1, "identity call only");
+      assert.equal(readdirSync(join(d, "context")).filter((f) => f.includes("chain-context")).length, 0, "no block file");
+      assert.ok(!readFileSync(promptFileArg(parts, "--append-system-prompt"), "utf8").includes("Chain context"));
+    });
+  });
+
+  it("replays the identical block and the original position from the loadout on resume", () => {
+    const loadout = {
+      ...unrestrictedLoadout,
+      agent: "reviewer",
+      systemPromptMode: "append" as const,
+      identity: "You are a reviewer.",
+      chain: stepTwo,
+    };
+    assert.equal(
+      testApi.chainBlockForLoadout(loadout as any),
+      testApi.buildChainContextBlock({
+        chainName: "fix-auth",
+        stepIndex: 2,
+        stepTotal: 3,
+        agent: "reviewer",
+        sequence: "worker → reviewer → worker",
+      }),
+      "resume rebuilds the launch's block verbatim",
+    );
+    // The position the resumed step reports is the persisted one.
+    assert.deepEqual(testApi.buildChainEnvParts(loadout.chain), [
+      `PI_SUBAGENT_CHAIN_NAME=${shellEscape("fix-auth")}`,
+      "PI_SUBAGENT_CHAIN_STEP=2",
+      "PI_SUBAGENT_CHAIN_STEP_TOTAL=3",
+      `PI_SUBAGENT_CHAIN_SEQUENCE=${shellEscape("worker → reviewer → worker")}`,
+    ]);
+  });
+
+  it("carries identity and block in one system-prompt value", () => {
+    const block = testApi.buildChainContextBlock({
+      chainName: "fix-auth",
+      stepIndex: 1,
+      stepTotal: 2,
+      agent: "worker",
+      sequence: "worker → reviewer",
+    });
+    // The Claude CLI branch builds its single --append-system-prompt argument
+    // with this same helper, so one value carries both pieces there too.
+    const both = testApi.composeSystemPromptText("You are a worker.", block);
+    assert.equal(both, `You are a worker.\n\n${block}`);
+    assert.ok(!both.includes("\n\n\n"), "exactly one separator");
+    assert.equal(testApi.composeSystemPromptText("You are a worker.", ""), "You are a worker.", "no chain → identity only");
+    assert.equal(testApi.composeSystemPromptText(null, block), block, "no identity → block only");
+    assert.equal(testApi.composeSystemPromptText(undefined, ""), "");
+    assert.equal(testApi.composeSystemPromptText("   ", ""), "", "blank identity contributes nothing");
+  });
+
+  it("replays launch and resume from the same persisted loadout snapshot", () => {
+    withTempDir((d) => {
+      const sessionFile = join(d, "sub-worker.jsonl");
+      writeSubagentLoadout(sessionFile, {
+        ...unrestrictedLoadout,
+        agent: "worker",
+        systemPromptMode: "append",
+        identity: "You are a worker.",
+        chain: stepTwo,
+      } as any);
+
+      // This is exactly what the resume path reads back and replays.
+      const restored = readSubagentLoadout(sessionFile);
+      assert.ok(restored, "snapshot readable");
+      assert.deepEqual(restored.chain, stepTwo, "position survived the round trip");
+
+      const parts: string[] = [];
+      testApi.applySandboxToParts(parts, restored, { artifactDir: d, name: "worker" });
+      assert.equal(parts.filter((p) => p === "--append-system-prompt").length, 1, "still exactly one call");
+      const written = readFileSync(promptFileArg(parts, "--append-system-prompt"), "utf8");
+      assert.ok(written.includes("You are a worker."), "identity replayed");
+      assert.ok(written.includes("step 2 of 3"), "position replayed, not recomputed");
+      assert.deepEqual(testApi.buildChainEnvParts(restored.chain), [
+        `PI_SUBAGENT_CHAIN_NAME=${shellEscape("fix-auth")}`,
+        "PI_SUBAGENT_CHAIN_STEP=2",
+        "PI_SUBAGENT_CHAIN_STEP_TOTAL=3",
+        `PI_SUBAGENT_CHAIN_SEQUENCE=${shellEscape("worker → reviewer → worker")}`,
+      ]);
+    });
+  });
+
+  it("never lets a corrupt snapshot inject text into the launch command", () => {
+    // Resume reads these numbers from an on-disk file, so they are sanitized
+    // rather than interpolated.
+    assert.deepEqual(
+      testApi.buildChainEnvParts({ chainName: "c", stepIndex: "2; rm -rf /", stepTotal: 3, sequence: "a → b" } as any),
+      [],
+      "an unusable step index means no chain vars at all",
+    );
+    assert.deepEqual(
+      testApi.buildChainEnvParts({ chainName: "c", stepIndex: "2", stepTotal: "x`id`", sequence: "a → b" } as any),
+      [],
+      "same for an unusable total",
+    );
+    assert.deepEqual(
+      testApi.buildChainEnvParts({ chainName: "c", stepIndex: 2.9, stepTotal: 3, sequence: "a → b" } as any),
+      [`PI_SUBAGENT_CHAIN_NAME=${shellEscape("c")}`, "PI_SUBAGENT_CHAIN_STEP=2", "PI_SUBAGENT_CHAIN_STEP_TOTAL=3", `PI_SUBAGENT_CHAIN_SEQUENCE=${shellEscape("a → b")}`],
+      "numbers are truncated, never quoted as text",
+    );
+    assert.equal(testApi.chainBlockForLoadout({ agent: "worker", chain: { chainName: "c", stepIndex: "1$(id)", stepTotal: 2, sequence: "a → b" } } as any), "");
+  });
+
+  it("never lets a corrupt snapshot reach the widget, so no channel disagrees", () => {
+    const corrupt = { chainName: "c", stepIndex: "2; rm -rf /", stepTotal: 3, sequence: "a → b" } as any;
+    // The widget, the env vars, and the block share one gate — so a snapshot
+    // that opts out of the block and the vars must opt out of the widget too,
+    // and must never contribute raw text (or ANSI) to a rendered TUI line.
+    assert.deepEqual(testApi.chainWidgetPosition(corrupt), {}, "an unusable position renders nothing");
+    assert.deepEqual(testApi.buildChainEnvParts(corrupt), [], "…no env vars…");
+    assert.equal(testApi.chainBlockForLoadout({ agent: "worker", chain: corrupt } as any), "", "…and no block");
+
+    // A one-step chain opts out of all three the same way.
+    assert.deepEqual(testApi.chainWidgetPosition({ chainName: "c", stepIndex: 1, stepTotal: 1, sequence: "worker" }), {});
+    assert.deepEqual(testApi.chainWidgetPosition(undefined), {}, "ordinary spawns have no widget position");
+    assert.deepEqual(testApi.chainWidgetPosition(null), {});
+    assert.deepEqual(testApi.chainWidgetPosition({ chainName: "c", stepIndex: 0, stepTotal: 3, sequence: "a → b" }), {}, "step 0 is not a position");
+    // A real position renders truncated integers, identical to the env vars.
+    assert.deepEqual(
+      testApi.chainWidgetPosition({ chainName: "c", stepIndex: 2.9, stepTotal: 3, sequence: "a → b" }),
+      { chainStep: 2, chainStepTotal: 3 },
+    );
+
+    const strip = (line: string) => line.replace(/\x1b\[[0-9;]*m/g, "");
+    const render = (chain: any) =>
+      strip(
+        testApi.renderSubagentWidgetLines(
+          [{ ...makeFakeRunning("worker"), agent: "worker", ...testApi.chainWidgetPosition(chain) }],
+          100,
+        )[1],
+      );
+    const row = render(corrupt);
+    assert.ok(!row.includes("rm") && !row.includes(";"), `no snapshot text in a widget row, got: ${row}`);
+    assert.ok(!row.includes("/3"), `and no position either — this launch is not a chain step, got: ${row}`);
+    assert.ok(render({ chainName: "c", stepIndex: 2.9, stepTotal: 3, sequence: "a → b" }).includes(" 2/3 "), "a valid position renders");
+  });
+
+  it("passes no system-prompt flag at all when identity and block are both blank", () => {
+    // A truthy-but-blank identity must not produce an empty prompt file, and a
+    // block-only delivery must never REPLACE pi's own system prompt.
+    withTempDir((d) => {
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        { ...unrestrictedLoadout, agent: "worker", systemPromptMode: "replace", identity: "   " },
+        { artifactDir: d, name: "worker" },
+      );
+      assert.equal(parts.filter((p) => p === "--append-system-prompt").length, 0);
+      assert.equal(parts.filter((p) => p === "--system-prompt").length, 0, "nothing is passed for a blank identity");
+    });
+    withTempDir((d) => {
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        { ...unrestrictedLoadout, agent: "worker", systemPromptMode: "replace", identity: null, chain: stepTwo },
+        { artifactDir: d, name: "worker" },
+      );
+      assert.equal(parts.filter((p) => p === "--system-prompt").length, 0, "the block never replaces the prompt");
+      assert.equal(parts.filter((p) => p === "--append-system-prompt").length, 1, "…it only ever appends");
+    });
+    withTempDir((d) => {
+      // A real identity still replaces when the snapshot says so.
+      const parts: string[] = [];
+      testApi.applySandboxToParts(
+        parts,
+        { ...unrestrictedLoadout, agent: "worker", systemPromptMode: "replace", identity: "You are a worker.", chain: stepTwo },
+        { artifactDir: d, name: "worker" },
+      );
+      assert.equal(parts.filter((p) => p === "--system-prompt").length, 1);
+      assert.equal(parts.filter((p) => p === "--append-system-prompt").length, 0, "still exactly one call");
+      const written = readFileSync(promptFileArg(parts, "--system-prompt"), "utf8");
+      assert.ok(written.includes("You are a worker.") && written.includes("## Chain context"));
+    });
+  });
+
   it("caps long non-final step outputs in the presentation", () => {
     assert.equal(testApi.truncateChainOutput("short", 100), "short");
     const long = testApi.truncateChainOutput("x".repeat(200), 100);
@@ -3342,6 +3743,98 @@ describe("subagent chain", () => {
       testApi.subagentOps.launch = origLaunch;
       testApi.subagentOps.watch = origWatch;
       testApi.setLatestCtxForTest(null);
+      testApi.runningSubagents.clear();
+    }
+  });
+
+  it("hands every chain step its position at launch, and nothing to a one-step chain", async () => {
+    const { api, registeredTools, sentMessages } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const origLaunch = testApi.subagentOps.launch;
+    const origWatch = testApi.subagentOps.watch;
+    const launched: Array<{ params: any; options: any }> = [];
+    testApi.subagentOps.launch = async (params: any, _ctx: any, options: any) => {
+      const fake = makeFakeRunning(params.name);
+      launched.push({ params, options, running: fake });
+      testApi.runningSubagents.set(fake.id, fake);
+      return fake;
+    };
+    testApi.subagentOps.watch = async (running: any) => {
+      testApi.runningSubagents.delete(running.id);
+      return { name: running.name, task: running.task, summary: "done", exitCode: 0, elapsed: 1 };
+    };
+    try {
+      await subagentTool.execute(
+        "call-1",
+        {
+          name: "pos-chain",
+          chain: [
+            { agent: "worker", task: "a" },
+            { agent: "reviewer", task: "b" },
+            { agent: "worker", task: "c" },
+          ],
+        },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      for (let i = 0; i < 100 && sentMessages.length === 0; i++) await chainSleep(10);
+
+      assert.equal(launched.length, 3, "every step launched");
+      launched.forEach((l, i) => {
+        assert.deepEqual(
+          l.options?.chainContext,
+          {
+            chainName: "pos-chain",
+            stepIndex: i + 1,
+            stepTotal: 3,
+            sequence: "worker → reviewer → worker",
+          },
+          `step ${i + 1} receives its own position`,
+        );
+        // System prompt only — the block never leaks into the task text.
+        assert.ok(!l.params.task.includes("## Chain context"), `step ${i + 1} task stays clean`);
+        // Widget position for the same step.
+        assert.equal(l.running.chainStep, i + 1, `step ${i + 1} reports its position to the widget`);
+        assert.equal(l.running.chainStepTotal, 3);
+      });
+
+      // What a step receives is exactly what becomes its env vars.
+      assert.deepEqual(testApi.buildChainEnvParts(launched[1].options.chainContext), [
+        `PI_SUBAGENT_CHAIN_NAME=${shellEscape("pos-chain")}`,
+        "PI_SUBAGENT_CHAIN_STEP=2",
+        "PI_SUBAGENT_CHAIN_STEP_TOTAL=3",
+        `PI_SUBAGENT_CHAIN_SEQUENCE=${shellEscape("worker → reviewer → worker")}`,
+      ]);
+
+      // A one-step chain is not a chain: the step launches with no chain
+      // context at all, so it gets neither the block nor the env vars — exactly
+      // like an ordinary single spawn (which never passes options either).
+      launched.length = 0;
+      await subagentTool.execute(
+        "call-2",
+        { name: "solo-chain", chain: [{ agent: "worker", task: "a" }] },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      for (let i = 0; i < 100 && sentMessages.length < 2; i++) await chainSleep(10);
+
+      assert.equal(launched.length, 1, "the one-step chain launched");
+      assert.equal(launched[0].options, undefined, "no chain context for a one-step chain");
+      assert.equal(launched[0].running.chainStep, undefined, "and no widget position either");
+      assert.deepEqual(testApi.buildChainEnvParts(launched[0].options?.chainContext), []);
+      assert.equal(testApi.buildChainContextBlock({ chainName: "solo-chain", stepIndex: 1, stepTotal: 1, agent: "worker", sequence: "worker" }), "");
+    } finally {
+      const leftover = testApi.getChainMapForSession(sessionId).get("solo-chain");
+      if (leftover && !leftover.finished) {
+        leftover.aborted = true;
+        leftover.abortController.abort();
+      }
+      testApi.subagentOps.launch = origLaunch;
+      testApi.subagentOps.watch = origWatch;
       testApi.runningSubagents.clear();
     }
   });

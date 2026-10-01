@@ -75,6 +75,7 @@ How it works:
 - If a step fails (non-zero exit, provider error, or its pane was closed), the remaining steps are marked `skipped` and the aggregate steer says exactly where the chain stopped and what never ran.
 - Steps are addressable by their names (auto-suffixed on collision, e.g. `worker`, `reviewer`, `worker-2`) via `subagent_message`, as usual. A message to the **chain name** is delivered to the chain's currently running step; a message to a finished chain's name gets an error pointing at its steps.
 - Per-step `model`, `cwd`, and cosmetic `name` overrides work the same as for single spawns.
+- Every step is told where it sits in the chain, so it knows the other steps exist: its system prompt gets a short `## Chain context` block — step N of M, the chain name, its own role, the full sequence (`worker → reviewer → worker`), and the fact that later steps run automatically and receive its final message, along with the fact that only the final step's final message reaches the orchestrator that started the chain, so each step should carry relevant information from earlier steps forward — and the same facts in its environment as `PI_SUBAGENT_CHAIN_NAME`, `PI_SUBAGENT_CHAIN_STEP` (1-based), `PI_SUBAGENT_CHAIN_STEP_TOTAL`, and `PI_SUBAGENT_CHAIN_SEQUENCE`. This is informational only — a step learns where it sits and what happens next; no spawn restriction of any kind is imposed (the `subagent_agents` / `PI_SUBAGENT_ALLOWED` allowlist is unchanged and remains the only gate). A resumed chain step keeps the position it originally ran with — it is read from the step's `loadout.json` snapshot, never recomputed, and the resumed widget shows the same sanitized position as its block and env vars.
 
 ### Messaging
 
@@ -89,7 +90,7 @@ subagent_message({ name: "scout", message: "Also check the auth middleware" });
 
 Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.
 
-**Resume replays the original sandbox.** At spawn time the fully-resolved loadout — tool allowlist, backing extensions, model, thinking level, system prompt, spawn whitelist, cwd — is snapshotted to `<session>.loadout.json`. Resume rebuilds the exact same restricted process from that snapshot rather than relaunching unrestricted.
+**Resume replays the original sandbox.** At spawn time the fully-resolved loadout — tool allowlist, backing extensions, model, thinking level, system prompt, spawn whitelist, cwd, chain position — is snapshotted to `<session>.loadout.json`. Resume rebuilds the exact same restricted process from that snapshot rather than relaunching unrestricted.
 
 ### ask_question
 
