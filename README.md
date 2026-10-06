@@ -47,7 +47,7 @@ subagent({ agent: "worker", name: "dark-mode", task: "Implement the dark mode to
 | --------- | ---- | ------- | ----------- |
 | `agent` | string | required (single mode) | Which agent to spawn (must be known and permitted) |
 | `task` | string | required (single mode) | Task prompt |
-| `name` | string | agent name | Display name for the pane and widget. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …). In chain mode this names the **chain** (its steps get their own names) |
+| `name` | string | agent name | Display name for the pane and widget. Must be unique — duplicates are auto-suffixed (`scout`, `scout-2`, …), and that holds for an explicit name too when it would collide with a name this session already answers to. In chain mode this names the **chain** (its steps get their own names) |
 | `model` | string | agent's model | Override the model for this spawn |
 | `cwd` | string | agent's `cwd` | Working directory (see [Role folders](#role-folders)) |
 | `chain` | `{agent, task, name?, model?, cwd?}[]` | — | Run a sequence of subagents one after another instead of a single spawn (see [Chains](#chains)) |
@@ -74,8 +74,19 @@ How it works:
 - Like every other spawn, the tool call is **fire-and-forget**: it returns an acknowledgement immediately, and ONE aggregate result for the whole chain — every step's status and output — is delivered as a steer message when the last step finishes, or when the chain stops early because a step failed. Do not poll; just wait for the steer.
 - If a step fails (non-zero exit, provider error, or its pane was closed), the remaining steps are marked `skipped` and the aggregate steer says exactly where the chain stopped and what never ran.
 - Steps are addressable by their names (auto-suffixed on collision, e.g. `worker`, `reviewer`, `worker-2`) via `subagent_message`, as usual. A message to the **chain name** is delivered to the chain's currently running step; a message to a finished chain's name gets an error pointing at its steps.
+- The **chain name never borrows a subagent's name**: it is auto-suffixed against running subagents, in-flight spawns, this session's registry, and other chains — because a name that matches a running subagent resolves to that subagent first, so a chain sharing one would be unreachable through its own name. If such a collision appears anyway (a subagent takes the name after the chain started), the message goes to the running subagent — never to the chain — and the reply says the name is also an active chain and names the step to address instead (`details.chainShadowed`). If the delivery to that subagent fails, the reply says the message reached neither, rather than claiming it landed.
 - Per-step `model`, `cwd`, and cosmetic `name` overrides work the same as for single spawns.
 - Every step is told where it sits in the chain, so it knows the other steps exist: its system prompt gets a short `## Chain context` block — step N of M, the chain name, its own role, the full sequence (`worker → reviewer → worker`), and the fact that any later steps run automatically and receive its final message, along with the fact that only the final step's final message reaches the orchestrator that started the chain, so each step should carry relevant information from earlier steps forward — and the same facts in its environment as `PI_SUBAGENT_CHAIN_NAME`, `PI_SUBAGENT_CHAIN_STEP` (1-based), `PI_SUBAGENT_CHAIN_STEP_TOTAL`, and `PI_SUBAGENT_CHAIN_SEQUENCE`. This is informational only — a step learns where it sits and what happens next; no spawn restriction of any kind is imposed (the `subagent_agents` / `PI_SUBAGENT_ALLOWED` allowlist is unchanged and remains the only gate). A resumed chain step keeps the position it originally ran with — it is read from the step's `loadout.json` snapshot, never recomputed, and the resumed widget shows the same sanitized position as its block and env vars.
+
+### Results identify themselves
+
+A steer message only shows the model its **text** — `details` goes to the renderers — so every completion, error, and `ask_question` notification spells out which run it belongs to:
+
+```
+Sub-agent "worker-2" (agent: worker; chain "fix-auth" step 2/3) completed (2m 11s).
+```
+
+The agent type is included whenever it is known (single spawns, resumed sessions, chain steps — a resumed run reads it back from its own `loadout.json`), and the chain part appears only for a real chain step (two or more steps), read from the same sanitized position as the step's block and env vars. A watcher that dies mid-run leads with the same header — `Sub-agent "worker" (agent: worker) error: …` — on both the spawn and the resume path. The aggregate chain result needs no such suffix: its `## Step i/N: agent (name)` headings already identify every step. The follow-up line under the result always names the plain display name, because that is the persistent handle. In the widget, a chain step's row shows the chain alongside its position: `finalize (worker) [fix-auth] 2/3`. Status transition lines lead the same way: `worker-2 [fix-auth 2/3] running 0:44, recovered; …`.
 
 ### Messaging
 
@@ -87,6 +98,7 @@ subagent_message({ name: "scout", message: "Also check the auth middleware" });
 
 - **Running** — the message is typed into the live pane (newlines flattened) and picked up at the next turn boundary. The call returns immediately; the eventual completion still arrives as a steer message.
 - **Finished** — the session is resumed with the message as the follow-up task, like a fresh spawn: fire-and-forget, always autonomous, result steered back later. The resumed run reclaims its original name.
+- **Resolution order** is running subagent → active chain (delivered to its current step) → this session's registry. A name that matches both a running subagent and an active chain goes to the running subagent, and the reply then flags the collision and names the chain's own step to address instead.
 
 Every spawn records name → session file in `artifacts/<sessionId>/subagent-registry.json`, so names stay addressable across pi restarts. A nested sub-agent that spawns children gets its own registry keyed by its own session id. Resume is refused with a clear error (listing known names) if the name isn't registered, the session file is gone, or the session predates sandboxed resume.
 

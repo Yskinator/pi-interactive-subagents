@@ -116,7 +116,8 @@ const SubagentParams = Type.Object({
       description:
         "Optional cosmetic label for the subagent's pane and widget row. Defaults to the agent name. " +
         "Has no effect on which agent runs — use `agent` for that. In chain mode this names the chain " +
-        "(its steps get their own names).",
+        "(its steps get their own names); a name another subagent or chain in this session already " +
+        "answers to is auto-suffixed, so every name stays addressable.",
     }),
   ),
   model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
@@ -776,16 +777,140 @@ function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
   return ` stalled${detail}${duration} `;
 }
 
+/**
+ * WHO just finished, in a form that can be rendered into model-visible text.
+ *
+ * A steer message only puts its `content` string in front of the model —
+ * `details` goes to the renderers — so an identifier that lives only in
+ * `details` is invisible to the very agent that has to act on it. With two
+ * `worker` steps of a chain finishing minutes apart, a bare
+ * `Sub-agent "worker" completed` is not enough to know which one woke the
+ * session up. Hence: name + agent type + chain position belong in the sentence.
+ */
+type ResultIdentity = {
+  name: string;
+  agent?: string;
+  chain?: { name?: string; stepIndex?: number; stepTotal?: number };
+};
+
+/** Cap (chars) on a chain label echoed into a single message/widget line. */
+const MAX_CHAIN_NAME_LENGTH = 60;
+
+/**
+ * Sanitize a chain label for display. Chain names originate as caller text and,
+ * on the resume path, arrive straight from an on-disk `.loadout.json` — so the
+ * rule is the one normalizeChain() applies to the numbers: never let untrusted
+ * text through. Control characters and newline runs collapse, an over-long
+ * label is cut, and anything unusable becomes "" (= no chain part).
+ */
+function displayChainName(raw: unknown): string {
+  const collapsed = String(raw ?? "")
+    .replace(/[\u0000-\u001f\u007f]/g, " ")
+    .replace(/\s+/g, " ")
+    .trim();
+  if (!collapsed) return "";
+  return collapsed.length > MAX_CHAIN_NAME_LENGTH ? collapsed.slice(0, MAX_CHAIN_NAME_LENGTH) : collapsed;
+}
+
+/**
+ * The identifier suffix for a completion/question line: ` (agent: worker; chain
+ * "c-1" step 2/3)`, joining only the parts that exist, and "" when there is
+ * nothing to report — which keeps the pre-existing wording byte-identical for
+ * callers that do not know the identity. The chain part goes through the same
+ * gate as the block, the env vars and the widget (normalizeChain: one step is
+ * not a chain), so a stale or hand-made object can never invent a chain.
+ */
+function formatResultIdentity(ref: ResultIdentity): string {
+  const parts: string[] = [];
+  const agent = ref.agent?.trim();
+  if (agent) parts.push(`agent: ${agent}`);
+  const chain = normalizeChain({
+    chainName: ref.chain?.name ?? "",
+    stepIndex: ref.chain?.stepIndex ?? 0,
+    stepTotal: ref.chain?.stepTotal ?? 0,
+    sequence: "",
+  });
+  const label = chain ? displayChainName(chain.chainName) : "";
+  if (chain && label) parts.push(`chain "${label}" step ${chain.stepIndex}/${chain.stepTotal}`);
+  return parts.length > 0 ? ` (${parts.join("; ")})` : "";
+}
+
+/**
+ * Derive the identity from a live `RunningSubagent`. Its chain fields are set
+ * together by chainWidgetPosition(), but they are re-checked here through the
+ * shared gate rather than trusted — a half-cleared object must read as an
+ * ordinary spawn, not as a chain step of a chain that no longer exists.
+ */
+function resultIdentityFor(
+  running: Pick<RunningSubagent, "name" | "agent" | "chainName" | "chainStep" | "chainStepTotal">,
+): ResultIdentity {
+  return {
+    name: running.name,
+    ...(running.agent ? { agent: running.agent } : {}),
+    chain: { name: running.chainName, stepIndex: running.chainStep, stepTotal: running.chainStepTotal },
+  };
+}
+
+/**
+ * The one header line every notification about a run leads with: the display
+ * name plus whatever identifies the run. Kept in one place so a completion, an
+ * `ask_question` and a watcher that THREW all name the same run — the renderer
+ * strips exactly one leading line, so all of it must live here.
+ */
+function resultLabel(ref: string | ResultIdentity): string {
+  const identity: ResultIdentity = typeof ref === "string" ? { name: ref } : ref;
+  return `Sub-agent "${identity.name}"${formatResultIdentity(identity)}`;
+}
+
+/**
+ * A watcher that rejected (pane vanished, polling blew up) still has to say
+ * which run it was watching — hence the same header as the completion paths,
+ * used by BOTH watcher catch blocks (spawn and resume).
+ */
+function formatWatcherError(ref: string | ResultIdentity, err: any): string {
+  return `${resultLabel(ref)} error: ${err?.message ?? String(err)}`;
+}
+
+/**
+ * The subject of a status/transition line: the display name plus enough chain
+ * identity to say WHICH run it is (a session running two chains otherwise gets
+ * two indistinguishable "worker stalled" lines). Appended here rather than
+ * inside formatTransitionLine(), which normalizes and truncates the name it is
+ * given — and it goes through the same chain gate as every other channel, so a
+ * one-step chain stays worded exactly as before.
+ */
+function statusSubjectName(
+  running: Pick<RunningSubagent, "name" | "chainName" | "chainStep" | "chainStepTotal">,
+): string {
+  const chain = normalizeChain({
+    chainName: running.chainName ?? "",
+    stepIndex: running.chainStep ?? 0,
+    stepTotal: running.chainStepTotal ?? 0,
+    sequence: "",
+  });
+  const label = chain ? displayChainName(chain.chainName) : "";
+  return chain && label ? `${running.name} [${label} ${chain.stepIndex}/${chain.stepTotal}]` : running.name;
+}
+
 function resolveResultPresentation(
   result: Pick<
     SubagentResult,
     "exitCode" | "elapsed" | "summary" | "sessionFile" | "sessionId" | "errorMessage"
   >,
-  name: string,
+  ref: string | ResultIdentity,
 ): string {
+  // A bare name is still a valid reference — it just means "identity unknown",
+  // which renders the old text exactly.
+  const identity: ResultIdentity = typeof ref === "string" ? { name: ref } : ref;
+  const name = identity.name;
   // Name is the persistent handle: the same name steers a running subagent or
-  // resumes a finished one, so follow-ups always reference it.
+  // resumes a finished one, so follow-ups always reference it. The agent/chain
+  // parts identify THIS run, so they stay out of the follow-up line.
   const sessionRef = `\n\nFollow up with subagent_message({ name: "${name}", message: "…" })`;
+  // One header line, identical in all three branches: the display name plus
+  // whatever identifies the run. The message renderer strips exactly one
+  // leading line, so every part of the identity must live on that line.
+  const label = resultLabel(identity);
 
   if (result.errorMessage) {
     // Auto-retry exhausted or other agent-loop error. The subagent did not
@@ -793,7 +918,7 @@ function resolveResultPresentation(
     // failure so the orchestrator can decide whether to retry, resume, or
     // change approach instead of silently treating the run as completed.
     return (
-      `Sub-agent "${name}" failed after ${formatElapsed(result.elapsed)} ` +
+      `${label} failed after ${formatElapsed(result.elapsed)} ` +
       `(provider/agent error — auto-retry exhausted).\n\n` +
       `Error: ${result.errorMessage}\n\n` +
       `The subagent did not produce a result. You can retry by spawning a new ` +
@@ -802,8 +927,8 @@ function resolveResultPresentation(
   }
 
   return result.exitCode !== 0
-    ? `Sub-agent "${name}" failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
-    : `Sub-agent "${name}" completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`;
+    ? `${label} failed (exit code ${result.exitCode}).\n\n${result.summary}${sessionRef}`
+    : `${label} completed (${formatElapsed(result.elapsed)}).\n\n${result.summary}${sessionRef}`;
 }
 
 /**
@@ -834,6 +959,13 @@ interface RunningSubagent {
   name: string;
   task: string;
   agent?: string;
+  /**
+   * Name of the parent chain (chain steps only). Without it the widget and the
+   * completion text can say "2/3" but not of which chain — and a session that
+   * runs two chains concurrently has two "2/3" rows. Set with the two numbers
+   * by chainWidgetPosition(), so all three appear or none do.
+   */
+  chainName?: string;
   /** 1-based index of the running step within the parent chain (chain steps only). */
   chainStep?: number;
   /** Total number of steps in the parent chain (chain steps only). */
@@ -1078,9 +1210,15 @@ function chainBlockForLoadout(loadout: SubagentLoadout): string {
  */
 function chainWidgetPosition(
   chain: SubagentChainContext | null | undefined,
-): { chainStep?: number; chainStepTotal?: number } {
+): { chainName?: string; chainStep?: number; chainStepTotal?: number } {
   const c = normalizeChain(chain);
-  return c ? { chainStep: c.stepIndex, chainStepTotal: c.stepTotal } : {};
+  if (!c) return {};
+  const chainName = displayChainName(c.chainName);
+  return {
+    ...(chainName ? { chainName } : {}),
+    chainStep: c.stepIndex,
+    chainStepTotal: c.stepTotal,
+  };
 }
 
 /**
@@ -1156,6 +1294,40 @@ function formatChainPresentation(chain: ActiveChain): string {
   if (stepNames.length > 0) tail.push(`Follow up on any step with ${stepNames.join(" or ")}.`);
 
   return [head, ...sections].join("\n\n---\n\n").concat(tail.length ? `\n\n${tail.join("\n")}` : "");
+}
+
+/**
+ * The note appended when one name answers to BOTH a running subagent and an
+ * active chain. Resolution order is running → chain, so the message went to the
+ * subagent and the chain is unreachable under that name — but "the message went
+ * to the subagent" is only true when the steer actually landed:
+ * handleSubagentSteer reports a failed pane write (or an ambiguous running
+ * match) in `details.error`, and promising delivery then would be false. Hence
+ * `delivered`, decided by the caller off exactly that field.
+ */
+function chainShadowNote(chain: ActiveChain, delivered: boolean): string {
+  // Never print "step 0/N": currentStep is 0 before the first step launches (and
+  // is reset on finish), and 0 with a running step cannot happen at all — either
+  // way it reads as "between steps", the wording the chain-delivery path uses for
+  // a chain whose steps are not running.
+  const position = chain.currentRunning && chain.currentStep >= 1
+    ? `step ${chain.currentStep}/${chain.steps.length} is running`
+    : "it is between steps";
+  const current = chain.currentRunning?.name ?? chain.steps[chain.currentStep - 1]?.name;
+  const stepNames = [...new Set(chain.steps.map((s) => s.name).filter(Boolean))].join(", ");
+  const where = current
+    ? `Reach that step by its own name instead: subagent_message({ name: "${current}", message: "…" }).`
+    : stepNames
+      ? `Its steps are addressable by their own names: ${stepNames}.`
+      : "Its steps are not named yet — wait for the aggregate chain steer.";
+  const outcome = delivered
+    ? "This message went to the running subagent of that name, not to the chain."
+    : "This message reached neither the running subagent (the steer above failed) nor the chain — a name " +
+      "that matches a running subagent is never resolved to a chain.";
+  return (
+    `Ambiguous subagent name "${chain.name}" — it is also an active chain ` +
+    `(${chain.steps.length} steps, ${position}). ${outcome} ${where}`
+  );
 }
 
 interface ChainStepRunResult {
@@ -1271,10 +1443,17 @@ async function runChain(
     // subagents, in-flight reservations, and the session's persistent
     // registry (earlier chain steps live there). Reserve it synchronously
     // (before any await) so parallel spawns can't collide.
+    //
+    // Only a name THIS chain reserved may be released below: an explicit step
+    // name was never ours to reserve, and `step.name` is later reassigned to
+    // whatever the launch actually used — releasing that could hand a name a
+    // concurrent spawn is holding to someone else.
+    let reservedStepName: string | null = null;
     if (!step.name) {
       const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
       step.name = uniqueRunningName(step.agent, registryNames);
-      reservedNames.add(step.name);
+      reservedStepName = step.name;
+      reservedNames.add(reservedStepName);
     }
 
     try {
@@ -1334,7 +1513,7 @@ async function runChain(
       step.status = "failed";
       step.errorMessage = err?.message ?? String(err);
     } finally {
-      if (step.name) reservedNames.delete(step.name);
+      if (reservedStepName) reservedNames.delete(reservedStepName);
     }
 
     if (step.status !== "completed") {
@@ -1461,10 +1640,23 @@ function startChain(
   );
   const sessionChains = getChainMapForSession(ctx.sessionManager.getSessionId());
   const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
+  // Every name a subagent of this session already answers to: the running ones,
+  // the ones claimed by parallel in-flight spawns, and the persistent registry.
+  // subagent_message resolves running subagents BEFORE chains, so a chain handed
+  // such a name would be permanently unreachable through its own name — it must
+  // pick a different one. uniqueRunningName() already avoids the first three for
+  // the defaulted case; the loop re-checks all of them, which also means an
+  // explicit `name` is auto-suffixed on collision exactly the way a chain name
+  // already was when it collided with another chain.
+  const nameTaken = (candidate: string): boolean =>
+    sessionChains.has(candidate) ||
+    registryNames.has(candidate) ||
+    reservedNames.has(candidate) ||
+    Array.from(runningSubagents.values()).some((r) => r.name === candidate);
   const baseName = params.name?.trim() || uniqueRunningName("chain", registryNames);
   let chainName = baseName;
   let suffix = 2;
-  while (sessionChains.has(chainName)) chainName = `${baseName}-${suffix++}`;
+  while (nameTaken(chainName)) chainName = `${baseName}-${suffix++}`;
 
   const chain: ActiveChain = {
     name: chainName,
@@ -1640,9 +1832,12 @@ function renderSubagentWidgetLines(agents: RunningSubagent[], width: number): st
   for (const agent of agents) {
     const elapsed = formatElapsedMMSS(agent.startTime);
     const agentTag = agent.agent ? ` (${agent.agent})` : "";
+    // Brackets keep the chain label from reading as part of the name; borderLine
+    // truncates this whole left side when the box is narrow, so an over-long
+    // chain name can never push the right-aligned status out of the box.
     const chainTag =
       agent.chainStep != null && agent.chainStepTotal != null
-        ? ` ${agent.chainStep}/${agent.chainStepTotal}`
+        ? `${agent.chainName ? ` [${agent.chainName}]` : ""} ${agent.chainStep}/${agent.chainStepTotal}`
         : "";
     const snapshot = classifyStatus(agent.statusState, Date.now());
     const icon = widgetIcon(snapshot.kind);
@@ -2126,7 +2321,7 @@ function startStatusRefresh(pi: ExtensionAPI) {
       // working in the subagent's pane, and a steer message here would burn an
       // orchestrator turn on a no-op "still waiting" ping. Widget still updates.
       if (transition && !running.interactive) {
-        transitionLines.push(formatTransitionLine(running.name, snapshot, transition));
+        transitionLines.push(formatTransitionLine(statusSubjectName(running), snapshot, transition));
       }
     }
 
@@ -2180,6 +2375,13 @@ export const __test__ = {
   handleSubagentSteer,
   deliverSubagentSteer,
   resolveResultPresentation,
+  formatResultIdentity,
+  resultLabel,
+  formatWatcherError,
+  chainShadowNote,
+  statusSubjectName,
+  resultIdentityFor,
+  displayChainName,
   resolveResumeLaunchBehavior,
   runningSubagents,
   formatElapsed,
@@ -2678,7 +2880,7 @@ function deliverPendingQuestion(running: RunningSubagent): void {
   latestPi?.sendMessage(
     {
       customType: "subagent_question",
-      content: `Sub-agent "${name}" asks (${formatElapsed(elapsed)}):\n\n${payload.question}${replyHint}`,
+      content: `${resultLabel(resultIdentityFor(running))} asks (${formatElapsed(elapsed)}):\n\n${payload.question}${replyHint}`,
       display: true,
       details: {
         name,
@@ -2891,7 +3093,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "you never need a {previous} placeholder or to paste prior output yourself. " +
         "The chain runs in the background and the aggregate result for the whole chain is delivered as a steer message " +
         "when the last step finishes, or when the chain stops early because a step failed. " +
-        "To reach the currently running step, use subagent_message with the chain name or the step's own name.",
+        "To reach the currently running step, use subagent_message with the chain name or the step's own name. " +
+        "Every completion steer names the run it belongs to — `Sub-agent \"<name>\" (agent: <agent>) completed …`, " +
+        "plus `; chain \"<chain>\" step i/N` for a chain step — so you always know which child woke you up.",
       promptSnippet:
         "Spawn a sub-agent in a dedicated terminal multiplexer pane. " +
         "This is a fire-and-forget async tool: the call returns immediately with only an acknowledgement. " +
@@ -2901,7 +3105,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "After spawning, either end your turn immediately, or work on other independent tasks (including spawning more subagents in parallel). The harness will wake you with the result when it is ready. " +
         "Chains: pass chain: [{agent, task}, ...] instead of agent+task to run subagents one after another — " +
         "each step's final output is automatically appended to the next step's task (no {previous} placeholder needed). " +
-        "The aggregate chain result arrives as a steer message when the chain finishes.",
+        "The aggregate chain result arrives as a steer message when the chain finishes. " +
+        "Completion steers name the run: `Sub-agent \"<name>\" (agent: <agent>; chain \"<chain>\" step i/N)`.",
       parameters: SubagentParams,
 
       async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
@@ -3054,7 +3259,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
 
-            const presentation = resolveResultPresentation(result, running.name);
+            const presentation = resolveResultPresentation(result, resultIdentityFor(running));
 
             pi.sendMessage(
               {
@@ -3079,10 +3284,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           })
           .catch((err) => {
             updateWidget();
+            // Same header as the success/failure paths — a watcher that throws
+            // must still say which run it was watching.
             pi.sendMessage(
               {
                 customType: "subagent_result",
-                content: `Sub-agent "${running.name}" error: ${err?.message ?? String(err)}`,
+                content: formatWatcherError(resultIdentityFor(running), err),
                 display: true,
                 details: { name: running.name, task: running.task, error: err?.message },
               },
@@ -3284,6 +3491,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "Send a message to a subagent by name. Names are unique within your session and persist after a subagent finishes, " +
         "so the SAME name works whether the subagent is running or finished: if it is still running, your message steers its live session; " +
         "if it has finished, your message resumes that session and continues it. " +
+        "A name that matches BOTH a running subagent and an active chain goes to the running subagent, and the reply then says so and names the chain's current step — address that step by its own name to reach the chain. " +
         "`name` and `message` are both required. " +
         "Steering a running subagent returns immediately with a local acknowledgement and does NOT, by itself, emit a new result. " +
         "Resuming is a fire-and-forget async call: when the resumed sub-agent finishes, the harness AUTOMATICALLY delivers its result as a steer message that wakes you up. " +
@@ -3291,6 +3499,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "DO NOT fabricate or assume results. After calling, either end your turn or work on other independent tasks.",
       promptSnippet:
         "Message a subagent by name: steers it if running, resumes it if finished (same name either way). " +
+        "If a name matches both a running subagent and an active chain, the running subagent gets the message and the reply names the chain's current step. " +
         "`name` and `message` are required. Steering returns immediately; resuming delivers its result later as a steer message. " +
         "Do not poll or fabricate results.",
       parameters: Type.Object({
@@ -3317,11 +3526,21 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         const details = result.details as any;
 
         if (details?.status === "steered") {
+          // A shadowed name means the reply text carries a collision warning the
+          // one-line ack would otherwise hide — keep it visible in the TUI too.
+          const warning = details.chainShadowed
+            ? "\n" +
+              theme.fg(
+                "warning",
+                "! this name is also an active chain — the message went to the running subagent",
+              )
+            : "";
           return new Text(
             theme.fg("success", "✓") +
               " " +
               theme.fg("toolTitle", theme.bold(details.name ?? "subagent")) +
-              theme.fg("dim", " — message delivered"),
+              theme.fg("dim", " — message delivered") +
+              warning,
             0,
             0,
           );
@@ -3359,7 +3578,28 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // A name that matches a currently-running subagent always steers it.
         const runningMatch = Array.from(runningSubagents.values()).find((r) => r.name === requestedName);
         if (runningMatch) {
-          return handleSubagentSteer({ name: requestedName, message: params.message });
+          const steer = handleSubagentSteer({ name: requestedName, message: params.message });
+          // Resolution order is running → chain → registry, so a chain that was
+          // given a name a subagent already answers to can never be reached
+          // here. Steering the live subagent is still the right call — but the
+          // collision has to be VISIBLE, or the orchestrator believes it just
+          // steered the chain. Hence a note on the returned text plus
+          // details.chainShadowed (details.error keeps its meaning unchanged).
+          const shadow = getChainMapForSession(ctx.sessionManager.getSessionId()).get(requestedName);
+          if (shadow && !shadow.finished) {
+            const head = typeof (steer.content[0] as { text?: string } | undefined)?.text === "string"
+              ? (steer.content[0] as { text: string }).text
+              : "";
+            // "steered" is the only shape handleSubagentSteer returns on success;
+            // anything with details.error means nothing was delivered.
+            const delivered = !steer.details?.error;
+            const note = chainShadowNote(shadow, delivered);
+            return {
+              content: [{ type: "text" as const, text: head ? `${head}\n\n${note}` : note }],
+              details: { ...steer.details, chainShadowed: true },
+            };
+          }
+          return steer;
         }
 
         // ── Message an active chain ──
@@ -3571,6 +3811,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           id,
           name,
           task: message,
+          // The loadout is the only record of what this session actually was —
+          // the name alone cannot say "worker" (nor which chain step it was),
+          // and the completion text needs both.
+          ...(loadout.agent ? { agent: loadout.agent } : {}),
           surface,
           startTime,
           sessionFile: sessionPath,
@@ -3607,7 +3851,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                   : "Resumed session exited without new output");
             const presentation = resolveResultPresentation(
               { ...result, summary, sessionFile: sessionPath, sessionId: resumedSessionId },
-              name,
+              resultIdentityFor(running),
             );
 
             pi.sendMessage(
@@ -3618,6 +3862,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
                 details: {
                   name,
                   task: message,
+                  ...(loadout.agent ? { agent: loadout.agent } : {}),
                   exitCode: result.exitCode,
                   elapsed: result.elapsed,
                   sessionFile: sessionPath,
@@ -3630,12 +3875,19 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           })
           .catch((err) => {
             updateWidget();
+            // The sibling of the spawn-path catch above: a resumed run's
+            // watcher rejecting must name the run in `content` too, not only
+            // in `details` (which the renderers, not the model, read).
             pi.sendMessage(
               {
                 customType: "subagent_result",
-                content: `Resume error: ${err?.message ?? String(err)}`,
+                content: formatWatcherError(resultIdentityFor(running), err),
                 display: true,
-                details: { name, error: err?.message },
+                details: {
+                  name,
+                  error: err?.message,
+                  ...(loadout.agent ? { agent: loadout.agent } : {}),
+                },
               },
               { triggerTurn: true, deliverAs: "steer" },
             );
@@ -3855,17 +4107,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
         const rawContent = typeof message.content === "string" ? message.content : "";
 
-        // Clean summary (remove follow-up ref and leading label for display)
+        // Clean summary (remove follow-up ref and the header line). The header is
+        // matched by shape rather than by exact wording: it now also carries the
+        // agent type and the chain position, and this renderer already composes an
+        // equivalent header line of its own from `details` — so the whole first
+        // line goes, whatever identifiers it spells out.
         const summary = rawContent
           .replace(/\n\nFollow up with subagent_message[\s\S]+$/, "")
-          .replace(`Sub-agent "${name}" completed (${elapsed}).\n\n`, "")
-          .replace(`Sub-agent "${name}" failed (exit code ${exitCode}).\n\n`, "")
-          .replace(
-            new RegExp(
-              `^Sub-agent "${name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")}" failed after ${elapsed} \\(provider/agent error — auto-retry exhausted\\)\\.\\n\\n`,
-            ),
-            "",
-          );
+          .replace(/^Sub-agent "[^\n]*\n\n/, "");
 
         // Build content for the box
         const contentLines = [header];

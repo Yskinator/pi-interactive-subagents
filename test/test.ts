@@ -3172,10 +3172,16 @@ describe("subagent chain", () => {
     assert.deepEqual(testApi.chainWidgetPosition(undefined), {}, "ordinary spawns have no widget position");
     assert.deepEqual(testApi.chainWidgetPosition(null), {});
     assert.deepEqual(testApi.chainWidgetPosition({ chainName: "c", stepIndex: 0, stepTotal: 3, sequence: "a → b" }), {}, "step 0 is not a position");
-    // A real position renders truncated integers, identical to the env vars.
+    // A real position renders truncated integers plus the chain label, identical
+    // to the env vars.
     assert.deepEqual(
       testApi.chainWidgetPosition({ chainName: "c", stepIndex: 2.9, stepTotal: 3, sequence: "a → b" }),
+      { chainName: "c", chainStep: 2, chainStepTotal: 3 },
+    );
+    assert.deepEqual(
+      testApi.chainWidgetPosition({ chainName: "  \n  ", stepIndex: 2, stepTotal: 3, sequence: "a → b" }),
       { chainStep: 2, chainStepTotal: 3 },
+      "an unusable label leaves the numbers alone — position is still known",
     );
 
     const strip = (line: string) => line.replace(/\x1b\[[0-9;]*m/g, "");
@@ -3394,6 +3400,7 @@ describe("subagent chain", () => {
       launched.forEach((fake: any, i: number) => {
         assert.equal(fake.chainStep, i + 1, `step ${i + 1} gets its 1-based index`);
         assert.equal(fake.chainStepTotal, 3, `step ${i + 1} gets the total step count`);
+        assert.equal(fake.chainName, "test-chain", `and step ${i + 1} says WHICH chain`);
       });
 
       // Automatic hand-off: each task starts with its own task and ends with
@@ -3851,6 +3858,207 @@ describe("subagent chain", () => {
       testApi.subagentOps.launch = origLaunch;
       testApi.subagentOps.watch = origWatch;
       testApi.runningSubagents.clear();
+    }
+  });
+
+  // ── Name-collision correctness ──
+
+  it("never hands a chain a name a subagent already answers to", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any, _ctx: any, parentArtifactDir: any) => {
+      // Register like the real runner does: the registry is what makes a
+      // FINISHED step's name still answer to subagent_message.
+      registerName(parentArtifactDir, step.name, {
+        sessionFile: join(sessionDir, `sub-${step.name}.jsonl`),
+        sessionId: null,
+      });
+      return { name: step.name, summary: "S", exitCode: 0, elapsed: 1 };
+    };
+    const running = makeFakeRunning("worker");
+    testApi.runningSubagents.set(running.id, running);
+    try {
+      // Resolution reaches running subagents first, so a chain named "worker"
+      // could never be reached through its own name — it must take a free one.
+      // An explicit `name` used to bypass every check, which is what made this
+      // reachable at all.
+      const clash = await subagentTool.execute(
+        "call-1",
+        {
+          name: "worker",
+          chain: [
+            { agent: "scout", task: "a", name: "step-a" },
+            { agent: "scout", task: "b", name: "step-b" },
+          ],
+        },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(clash.details?.chainName, "worker-2", "the chain yields to the running subagent");
+      const chains = testApi.getChainMapForSession(sessionId);
+      assert.ok(chains.has("worker-2"), "and it is registered under the free name");
+      for (let i = 0; i < 50 && !chains.get("worker-2")?.finished; i++) await chainSleep(10);
+
+      // Same for a name a finished subagent still answers to via the registry.
+      const registryClash = await subagentTool.execute(
+        "call-2",
+        {
+          name: "step-a",
+          chain: [
+            { agent: "scout", task: "c", name: "step-c" },
+            { agent: "scout", task: "d", name: "step-d" },
+          ],
+        },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(registryClash.details?.chainName, "step-a-2");
+      assert.ok(chains.has("step-a-2"));
+      for (let i = 0; i < 50 && !chains.get("step-a-2")?.finished; i++) await chainSleep(10);
+    } finally {
+      for (const chain of testApi.getChainMapForSession(sessionId).values()) {
+        if (!chain.finished) {
+          chain.aborted = true;
+          chain.abortController.abort();
+        }
+      }
+      testApi.runningSubagents.delete(running.id);
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("says so when a name is both a running subagent and an active chain", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const messageTool = registeredTools.find((tool) => tool.name === "subagent_message");
+
+    let releaseStep: () => void;
+    const gate = new Promise<void>((r) => (releaseStep = r));
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (
+      step: any,
+      _ctx: any,
+      _parentArtifactDir: any,
+      _pi: any,
+      signal: AbortSignal,
+      hooks: any,
+    ) => {
+      const fake = makeFakeRunning(step.name);
+      hooks.onLaunched(fake);
+      await Promise.race([
+        gate,
+        new Promise<void>((r) => signal.addEventListener("abort", () => r(), { once: true })),
+      ]);
+      return { name: step.name, summary: "S", exitCode: 0, elapsed: 1 };
+    };
+    const pretender = makeFakeRunning("worker");
+    try {
+      await subagentTool.execute(
+        "call-1",
+        { name: "worker", chain: [{ agent: "scout", task: "a" }, { agent: "scout", task: "b" }] },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      const chain = testApi.getChainMapForSession(sessionId).get("worker");
+      assert.ok(chain, "the chain kept its explicit name — nothing answered to it yet");
+      for (let i = 0; i < 50 && chain.currentStep === 0; i++) await chainSleep(10);
+      assert.equal(chain.currentStep, 1, "step 1 is running");
+
+      // The collision this covers: a chain started under a name, and only
+      // LATER a subagent that answers to it. Resolution prefers the running
+      // subagent, so the chain is unreachable — the delivery must say so rather
+      // than let the orchestrator believe it steered the chain.
+      testApi.runningSubagents.set(pretender.id, pretender);
+      const result = await messageTool.execute(
+        "call-2",
+        { name: "worker", message: "hurry up" },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(result.details?.chainShadowed, true, "the collision is reported to renderers");
+      assert.match(result.content[0].text, /Ambiguous subagent name "worker" — it is also an active chain/);
+      assert.match(result.content[0].text, /steps, step 1\/2 is running/);
+      assert.match(result.content[0].text, /name: "scout"/, "and it names the chain's own step");
+      // The note must match what actually happened. Whether the pane write to the
+      // fake "%stub" surface succeeds depends on the machine, so assert the
+      // invariant instead of one wording: it may only claim delivery when the
+      // steer reported none — and it must never blame the chain for a failure.
+      const text = result.content[0].text;
+      if (result.details?.error) {
+        assert.match(text, /reached neither the running subagent.*nor the chain/s);
+        assert.doesNotMatch(text, /went to the running subagent/, "nothing was delivered — do not claim it was");
+      } else {
+        assert.match(text, /went to the running subagent of that name, not to the chain/);
+      }
+
+      chain.aborted = true;
+      chain.abortController.abort();
+      releaseStep();
+      for (let i = 0; i < 50 && !chain.finished; i++) await chainSleep(10);
+
+      // A finished chain must not shadow anything — the name is unambiguous again.
+      const after = await messageTool.execute(
+        "call-3",
+        { name: "worker", message: "again" },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(after.details?.chainShadowed, undefined, "no note once the chain is done");
+      assert.doesNotMatch(after.content[0].text, /Ambiguous subagent name/);
+    } finally {
+      const chain = testApi.getChainMapForSession(sessionId).get("worker");
+      if (chain && !chain.finished) {
+        chain.aborted = true;
+        chain.abortController.abort();
+      }
+      releaseStep?.();
+      testApi.runningSubagents.delete(pretender.id);
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("never releases a chain-step name it did not reserve", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any) => ({ name: step.name, summary: "S", exitCode: 0, elapsed: 1 });
+    // A name a concurrent spawn is holding. The chain step below is LAUNCHED
+    // under this very name (explicitly), and used to free it in its finally —
+    // letting the parallel spawn be overwritten while it was still in use.
+    testApi.reservedNames.add("scout");
+    try {
+      await subagentTool.execute(
+        "call-1",
+        { chain: [{ agent: "scout", task: "a", name: "scout" }, { agent: "scout", task: "b" }] },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      const chain = testApi.getChainMapForSession(sessionId).get("chain");
+      assert.ok(chain, "the chain defaulted a name of its own");
+      for (let i = 0; i < 50 && !chain.finished; i++) await chainSleep(10);
+
+      assert.ok(testApi.reservedNames.has("scout"), "the other spawn's reservation survives");
+      assert.ok(!testApi.reservedNames.has("scout-2"), "the name this chain DID reserve is released");
+    } finally {
+      const chain = testApi.getChainMapForSession(sessionId).get("chain");
+      if (chain && !chain.finished) {
+        chain.aborted = true;
+        chain.abortController.abort();
+      }
+      testApi.reservedNames.delete("scout");
+      testApi.chainHooks.runStep = original;
     }
   });
 });
@@ -5065,6 +5273,222 @@ describe("subagent interruption", () => {
     assert.match(presentation, /subagent_message\(\{ name: "Worker"/);
     assert.doesNotMatch(presentation, /Session id:/);
     assert.doesNotMatch(presentation, /ignored when errorMessage is present/);
+  });
+});
+
+describe("subagent result identity", () => {
+  const testApi = (subagentsModule as any).__test__;
+  const stripAnsi = (line: string) => line.replace(/\x1b\[[0-9;]*m/g, "");
+
+  // Only the `content` string of a steer message reaches the model, so the
+  // identifiers have to be spelled out in the text — a `details.agent` that no
+  // renderer is obliged to show is not enough to tell two finished runs apart.
+  it("names the agent in the completion text, and says nothing when the identity is unknown", () => {
+    const result = {
+      exitCode: 0,
+      elapsed: 12,
+      summary: "Done.",
+      sessionFile: "/tmp/subagent.jsonl",
+    };
+
+    const bare = testApi.resolveResultPresentation(result, "worker");
+    assert.ok(bare.startsWith(`Sub-agent "worker" completed (12s).`), bare);
+    assert.ok(!bare.includes("(agent:"), "an unknown identity keeps the old wording byte-for-byte");
+
+    const identified = testApi.resolveResultPresentation(result, { name: "worker-2", agent: "worker" });
+    assert.match(identified, /^Sub-agent "worker-2" \(agent: worker\) completed \(12s\)\./);
+    // The follow-up handle stays the bare display name — it is the persistent
+    // handle, and the identifiers describe this particular run.
+    assert.match(identified, /subagent_message\(\{ name: "worker-2", message: "…" \}\)/);
+    assert.ok(!identified.includes(`name: "worker-2" (agent`), "the follow-up line is not decorated");
+  });
+
+  it("says which chain step finished, and only when it really is a chain step", () => {
+    const identity = testApi.resultIdentityFor({
+      name: "worker-2",
+      agent: "worker",
+      chainName: "fix-auth",
+      chainStep: 2,
+      chainStepTotal: 3,
+    });
+    const text = testApi.resolveResultPresentation(
+      { exitCode: 0, elapsed: 5, summary: "Done." },
+      identity,
+    );
+    assert.match(
+      text,
+      /^Sub-agent "worker-2" \(agent: worker; chain "fix-auth" step 2\/3\) completed \(5s\)\./,
+    );
+
+    // One step is not a chain — the same opt-out the block, the env vars and
+    // the widget use — and a half-populated object invents nothing.
+    assert.equal(testApi.formatResultIdentity({ name: "w", chain: { name: "c", stepIndex: 1, stepTotal: 1 } }), "");
+    assert.equal(testApi.formatResultIdentity({ name: "w", chain: { name: "c" } }), "");
+    assert.equal(testApi.formatResultIdentity({ name: "w", chain: {} }), "");
+    assert.equal(testApi.formatResultIdentity({ name: "w" }), "", "nothing to report → the old wording");
+    assert.equal(
+      testApi.formatResultIdentity({
+        name: "w",
+        agent: " worker ",
+        chain: { name: " ", stepIndex: "2; rm -rf /", stepTotal: 3 },
+      }),
+      " (agent: worker)",
+      "a corrupt or blank chain contributes nothing, and the agent is trimmed",
+    );
+    assert.equal(
+      testApi.formatResultIdentity(testApi.resultIdentityFor({ name: "w", chainName: "c", chainStep: 2 })),
+      "",
+      "a stale running object with no total is not a chain step",
+    );
+  });
+
+  // Both watcher catch blocks (spawn and resume) build their line through
+  // formatWatcherError, so a rejected watcher still names the run it was
+  // watching — `details.name` alone never reaches the model.
+  it("names the run when a watcher rejects", () => {
+    const err = new Error("tmux disappeared");
+    assert.equal(testApi.formatWatcherError("worker", err), `Sub-agent "worker" error: tmux disappeared`);
+    assert.equal(
+      testApi.formatWatcherError(
+        { name: "worker-2", agent: "worker", chain: { name: "fix-auth", stepIndex: 2, stepTotal: 3 } },
+        err,
+      ),
+      `Sub-agent "worker-2" (agent: worker; chain "fix-auth" step 2/3) error: tmux disappeared`,
+    );
+    assert.match(testApi.formatWatcherError("w", "boom"), /error: boom$/, "a thrown non-Error still reads");
+  });
+
+  it("only claims delivery in the chain-shadow note when the message was delivered", () => {
+    const chain: any = {
+      name: "worker",
+      currentStep: 1,
+      currentRunning: { name: "scout" },
+      steps: [{ name: "scout" }, { name: "scout-2" }],
+    };
+    const delivered = testApi.chainShadowNote(chain, true);
+    assert.match(
+      delivered,
+      /^Ambiguous subagent name "worker" — it is also an active chain \(2 steps, step 1\/2 is running\)\./,
+    );
+    assert.match(delivered, /went to the running subagent of that name, not to the chain\./);
+    assert.match(delivered, /subagent_message\(\{ name: "scout", message: "…" \}\)/);
+
+    const failed = testApi.chainShadowNote(chain, false);
+    assert.match(failed, /reached neither the running subagent.*nor the chain/s);
+    assert.ok(!/went to the running subagent/.test(failed), "a failed delivery is never reported as delivered");
+
+    // currentStep 0 (before the first step launched, or reset on finish) must not
+    // print "step 0/2" — it reads as "between steps", like the chain-delivery path.
+    const idle = testApi.chainShadowNote(
+      { name: "worker", currentStep: 0, currentRunning: null, steps: [{}, {}] },
+      true,
+    );
+    assert.match(idle, /it is between steps/);
+    assert.doesNotMatch(idle, /0\/2/, "no step is running — no step number is claimed");
+    assert.match(idle, /Its steps are not named yet/);
+
+    const odd = testApi.chainShadowNote(
+      { name: "worker", currentStep: 0, currentRunning: { name: "scout" }, steps: [{ name: "scout" }, {}] },
+      true,
+    );
+    assert.doesNotMatch(odd, /0\/2/, "a half-populated chain invents no step number");
+  });
+
+  it("sanitises a persisted chain label before putting it on one line", () => {
+    assert.equal(testApi.displayChainName("  fix-auth "), "fix-auth");
+    assert.equal(testApi.displayChainName("a\nb"), "a b", "newlines collapse, never break the line");
+    assert.equal(testApi.displayChainName("a\u0000b\u001bc"), "a b c", "control characters cannot smuggle a sequence");
+    assert.equal(testApi.displayChainName("\n \t "), "", "whitespace-only is no label at all");
+    assert.equal(testApi.displayChainName(undefined), "");
+    assert.equal(testApi.displayChainName("x".repeat(500)), "x".repeat(60), "and a label is capped");
+  });
+
+  it("shows the chain name in the widget row without breaking the width contract", () => {
+    const startTime = 1_000_000 - 44_000;
+    const row = (width: number) =>
+      stripAnsi(
+        testApi.renderSubagentWidgetLines(
+          [
+            {
+              id: "c1",
+              name: "finalize",
+              agent: "worker",
+              chainName: "fix-auth",
+              chainStep: 2,
+              chainStepTotal: 3,
+              task: "",
+              surface: "s1",
+              startTime,
+              sessionFile: "sess1",
+              statusState: createStatusState({ source: "pi", startTimeMs: startTime }),
+            },
+          ],
+          width,
+        )[1],
+      );
+
+    const originalNow = Date.now;
+    Date.now = () => 1_000_000;
+    try {
+      const wide = row(100);
+      assert.ok(wide.includes("finalize (worker) [fix-auth] 2/3 "), wide);
+      for (const width of [100, 60, 40, 20, 3, 1]) {
+        assert.ok(visibleWidth(row(width)) <= width, `row must fit ${width}: ${row(width)}`);
+      }
+    } finally {
+      Date.now = originalNow;
+    }
+  });
+
+  it("says which chain a status transition belongs to", () => {
+    assert.equal(testApi.statusSubjectName({ name: "worker" }), "worker", "an ordinary spawn is worded exactly as before");
+    assert.equal(
+      testApi.statusSubjectName({ name: "worker-2", chainName: "fix-auth", chainStep: 2, chainStepTotal: 3 }),
+      "worker-2 [fix-auth 2/3]",
+    );
+    assert.equal(
+      testApi.statusSubjectName({ name: "worker", chainName: "solo", chainStep: 1, chainStepTotal: 1 }),
+      "worker",
+      "one step is not a chain — same gate as every other channel",
+    );
+    assert.match(
+      formatStatusLine(
+        testApi.statusSubjectName({ name: "w", chainName: "c", chainStep: 2, chainStepTotal: 3 }),
+        { kind: "running", elapsedText: "0:44" } as any,
+      ),
+      /^w \[c 2\/3\] running 0:44\.$/,
+      "the transition line stays one bounded line",
+    );
+  });
+
+  it("keeps the identity header out of the rendered body", () => {
+    // The renderer composes its own header from `details` and strips exactly one
+    // leading line of `content` — which is why every identifier has to live on
+    // that line rather than further down.
+    const { api, registeredMessageRenderers } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const entry = registeredMessageRenderers.find((r: any) => r.name === "subagent_result");
+    assert.ok(entry, "expected the subagent_result renderer to be registered");
+    const theme: any = { fg: (_c: string, t: string) => t, bg: (_c: string, t: string) => t, bold: (t: string) => t };
+
+    const rendered = entry
+      .renderer(
+        {
+          role: "user",
+          content:
+            `Sub-agent "worker-2" (agent: worker; chain "fix-auth" step 2/3) completed (12s).\n\n` +
+            `Done.\n\nFollow up with subagent_message({ name: "worker-2", message: "…" })`,
+          details: { name: "worker-2", agent: "worker", exitCode: 0, elapsed: 12 },
+        },
+        { expanded: true },
+        theme,
+      )
+      .render(100)
+      .join("\n");
+
+    assert.ok(rendered.includes("Done."), rendered);
+    assert.ok(!rendered.includes('Sub-agent "'), `header must not be printed twice: ${rendered}`);
+    assert.ok(!rendered.includes("Follow up with subagent_message"), rendered);
   });
 });
 
