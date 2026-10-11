@@ -92,7 +92,16 @@ const POLL_ABORT_KEY = Symbol.for("pi-subagents/poll-abort-controller");
 }
 
 function getModuleAbortSignal(): AbortSignal {
-  return ((globalThis as any)[POLL_ABORT_KEY] as AbortController).signal;
+  let controller = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
+  // A teardown can leave the shared controller aborted (one that cannot attribute
+  // its session stops everything it can see). A watcher started after that must
+  // not be born dead, so replace an aborted controller here: the watchers meant
+  // to die already hold the old signal, so this aborts nothing that should live.
+  if (!controller || controller.signal.aborted) {
+    controller = new AbortController();
+    (globalThis as any)[POLL_ABORT_KEY] = controller;
+  }
+  return controller.signal;
 }
 
 const SubagentParams = Type.Object({
@@ -114,10 +123,14 @@ const SubagentParams = Type.Object({
   name: Type.Optional(
     Type.String({
       description:
-        "Optional cosmetic label for the subagent's pane and widget row. Defaults to the agent name. " +
-        "Has no effect on which agent runs — use `agent` for that. In chain mode this names the chain " +
-        "(its steps get their own names); a name another subagent or chain in this session already " +
-        "answers to is auto-suffixed, so every name stays addressable.",
+        "Optional cosmetic label for the subagent's pane and widget row. Defaults to the agent name " +
+        "(auto-suffixed on collision, e.g. `worker-2`). Has no effect on which agent runs — use `agent` for that. " +
+        "A name YOU supply must be free WITHIN THIS SESSION: if a running sub-agent, an in-flight spawn, a chain, " +
+        "a step name another chain has reserved, or this session's registry already holds it the call is " +
+        "REJECTED (it is not renamed) — pick another name. " +
+        "What another session in the same process runs never blocks a name here. In chain mode this names the CHAIN (its steps " +
+        "get their own names) under exactly the same rule: a chain name you supply is rejected on collision, and only " +
+        "a name the system generated because you omitted `name` is auto-suffixed.",
     }),
   ),
   model: Type.Optional(Type.String({ description: "Model override (overrides agent default)" })),
@@ -141,7 +154,15 @@ const SubagentParams = Type.Object({
         name: Type.Optional(
           Type.String({
             description:
-              "Optional cosmetic label for this step's pane. Defaults to the agent name (auto-suffixed on collision).",
+              "Optional cosmetic label for this step's pane. Defaults to the agent name (auto-suffixed when the " +
+              "system generates it). A name you supply must be free WITHIN THIS SESSION — of its running sub-agents, " +
+              "in-flight spawns, registry, every chain handle (including this chain's own name), and the step " +
+              "names other chains of this session have reserved for their not-yet-run steps. Every one of those is checked at this tool call: a " +
+              "clash is rejected immediately and the chain never starts, with `details.step` saying which step. Your own step names are then reserved for the " +
+              "chain until that step starts, and released when it runs or the chain ends. The only late name failure " +
+              "possible is one " +
+              "taken AFTER the chain started by something in this session (a parallel spawn, or an earlier step that " +
+              "registered it), which no up-front check could know about — that stops the chain at that step.",
           }),
         ),
         model: Type.Optional(Type.String({ description: "Model override for this step (overrides agent default)" })),
@@ -756,6 +777,75 @@ function getArtifactDir(sessionDir: string, sessionId: string): string {
   return join(sessionDir, "artifacts", sessionId);
 }
 
+/**
+ * Slug a display name for use inside an artifact filename (empty when the name
+ * has nothing filename-safe in it — callers supply a fallback).
+ */
+function artifactNameSlug(name: string | undefined | null): string {
+  return (name ?? "")
+    .toLowerCase()
+    .replace(/[^a-z0-9\s-]/g, "") // strip everything except alphanumeric, spaces, hyphens
+    .replace(/\s+/g, "-") // spaces to hyphens
+    .replace(/-+/g, "-") // collapse multiple hyphens
+    .replace(/^-|-$/g, ""); // trim leading/trailing hyphens
+}
+
+/**
+ * Artifact path for one piece of per-launch hand-off text (task brief, system
+ * prompt / chain-context block, resume message):
+ * `<slug>[-<kind>]-<timestamp>-<id>.md`.
+ *
+ * The launch `id` is part of the name ON PURPOSE. A name+timestamp path is only
+ * unique per name-per-second, so two launches of the same agent+name in the same
+ * wall-clock second — exactly what two parallel `subagent({ name: "test" })`
+ * calls are — computed the SAME path, and the second write silently clobbered
+ * the first launch's brief before it was ever read: both sub-agents got the same
+ * task and replied identically. `id` is already unique per launch (it keys
+ * `runningSubagents` and the activity file), so uniqueness holds per launch even
+ * for legitimately distinct launches that share a name or a millisecond. The
+ * readable name+timestamp prefix is kept so the files stay greppable.
+ */
+function launchArtifactPath(
+  artifactDir: string,
+  opts: { dir: string; name?: string; id?: string; kind?: string; fallback?: string },
+): string {
+  const slug = artifactNameSlug(opts.name) || opts.fallback || "subagent";
+  const kind = opts.kind ? `-${opts.kind}` : "";
+  const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
+  // Callers always pass the launch id; the random fallback only keeps a
+  // hand-written call (tests) from producing a shared path.
+  const id = opts.id || Math.random().toString(16).slice(2, 10);
+  return join(artifactDir, opts.dir, `${slug}${kind}-${timestamp}-${id}.md`);
+}
+
+/**
+ * Write an artifact WITHOUT ever replacing one that already exists, and return
+ * the path actually written. With a per-launch `id` in the name a collision is
+ * unreachable by construction; the numbered fallbacks (and the final throw) are
+ * there so a collision can never degrade into a silent overwrite.
+ */
+function writeArtifactExclusive(path: string, text: string): string {
+  mkdirSync(dirname(path), { recursive: true });
+  const writeExclusive = (target: string): "ok" | "exists" => {
+    try {
+      writeFileSync(target, text, { encoding: "utf8", flag: "wx" });
+      return "ok";
+    } catch (err: any) {
+      if (err?.code === "EEXIST") return "exists";
+      throw err;
+    }
+  };
+  if (writeExclusive(path) === "ok") return path;
+  const stem = path.replace(/\.md$/, "");
+  for (let n = 2; n <= 100; n++) {
+    if (writeExclusive(`${stem}-${n}.md`) === "ok") return `${stem}-${n}.md`;
+  }
+  throw new Error(
+    `Could not write subagent artifact ${path}: it already exists, as do all numbered alternatives. ` +
+      `Per-launch artifact paths must be unique — refusing to overwrite.`,
+  );
+}
+
 const statusConfig = loadStatusConfig();
 
 function formatWidgetRightLabel(snapshot: StatusSnapshot): string {
@@ -973,6 +1063,16 @@ interface RunningSubagent {
   surface: string;
   startTime: number;
   sessionFile: string;
+  /**
+   * The SPAWNER session this row belongs to — never the sub-agent's own id
+   * (that one is the header of `sessionFile`). `runningSubagents` is one flat
+   * process-global map and a single pi process can host several sessions, so a
+   * session's teardown must know whose watcher each row is: aborting by map
+   * position would abort a stranger's sub-agent and wipe its widget row. Set at
+   * launch; optional because rows from an older module load carry none, and
+   * `parentSessionOf()` then falls back to the artifact path.
+   */
+  parentSessionId?: string;
   launchScriptFile?: string;
   activityFile?: string;
   activity?: SubagentActivityState;
@@ -1012,6 +1112,43 @@ interface RunningSubagent {
 /** All currently running subagents, keyed by id. */
 const runningSubagents = new Map<string, RunningSubagent>();
 
+/**
+ * Which spawner session owns this row — the question `session_shutdown` must
+ * answer before aborting anything, since one pi process can serve several
+ * sessions while this map stays process-global.
+ *
+ * The launch-time id is authoritative. Otherwise the artifact path still says:
+ * every row created here gets its activity file under
+ * `<sessionDir>/artifacts/<spawnerSessionId>/subagent-activity/<id>.json`, so
+ * even a row from a code path that never set `parentSessionId` identifies its
+ * owner. Null means genuinely unattributable — and teardown treats that as
+ * "ours" (abort it) rather than as a stranger's.
+ */
+function parentSessionOf(running: RunningSubagent): string | null {
+  if (running.parentSessionId) return running.parentSessionId;
+  return running.activityFile?.match(/[\\/]artifacts[\\/]([^\\/]+)[\\/]/)?.[1] ?? null;
+}
+
+/**
+ * Does this row's NAME count as taken for `sessionId` — and does the row answer
+ * to a lookup from that session? The running map is process-global while every
+ * other name store (the registry, the chain map, the step-name reservations) is
+ * per-session, so a name scan has to pick a scope or the two halves disagree:
+ * session A's chain would promise a name that session B is happily handed, and A
+ * would then fail mid-chain on the name its own caller chose.
+ *
+ * A row with NO owner is visible to every session — the conservative reading, and
+ * the one `isOurs` and the auto-exit count already use: an unattributable row may
+ * never be stolen (which would orphan it), only honoured. With no session id the
+ * caller cannot be attributed, so the whole process is honoured — exactly what the
+ * `reservedNames` and step-name-lock checks do in the same situation.
+ */
+function nameRowVisibleTo(running: RunningSubagent, sessionId: string | undefined | null): boolean {
+  if (!sessionId) return true;
+  const owner = parentSessionOf(running);
+  return owner === null || owner === sessionId;
+}
+
 // When this extension is loaded inside a subagent that itself spawns children
 // (e.g. a worker delegating to scout/researcher), `subagent-done.ts` runs in the
 // same process and needs to know whether this session still has children in
@@ -1019,7 +1156,22 @@ const runningSubagents = new Map<string, RunningSubagent>();
 // report back. Expose a live count through a process-global symbol that both
 // modules share. (subagent-done.ts reads it; if absent it assumes zero.)
 const RUNNING_CHILDREN_COUNT_KEY = Symbol.for("pi-subagents/running-children-count");
-(globalThis as any)[RUNNING_CHILDREN_COUNT_KEY] = () => runningSubagents.size;
+// Pass the asking session's id to count only ITS children. `runningSubagents` is
+// process-global, so an unscoped count lets another session's sub-agents pin this
+// one's auto-exit forever — the same cross-session leak `session_shutdown` avoids.
+// A row with no owner at all is still counted: it might be this session's, and
+// exiting while a child is live would strand it (exactly what this guards).
+// With no id the caller cannot be scoped, so the whole map is counted (the
+// historical behaviour, and the right reading for a single-session process).
+(globalThis as any)[RUNNING_CHILDREN_COUNT_KEY] = (sessionId?: string | null) => {
+  if (!sessionId) return runningSubagents.size;
+  let count = 0;
+  for (const row of runningSubagents.values()) {
+    const owner = parentSessionOf(row);
+    if (owner === sessionId || owner === null) count++;
+  }
+  return count;
+};
 
 // ── Chains ──────────────────────────────────────────────────────────────────
 // `chain` mode of the subagent tool: run subagents one after another
@@ -1432,31 +1584,79 @@ async function runChain(
 
   for (const step of chain.steps) {
     if (chain.aborted || chain.abortController.signal.aborted) {
+      // An aborted chain never reaches the release below, so a step skipped here
+      // keeps its reservation until the loop ends — which every abort does, since
+      // this branch runs for the rest of the steps and then falls through to the
+      // chain-end `releaseStepNameLocks(chain)`. In the window before that the lock
+      // already reads as stale (abort is checked first in `stepNameLockIsStale`), so
+      // the name is free to anyone who asks even while the entry still exists.
       step.status = "skipped";
       continue;
     }
+
+    // This step is about to start, so its promised name becomes its own handle:
+    // give the reservation up FIRST and explicitly — before the name below is
+    // checked or generated, because a chain must never be rejected against a name it
+    // is itself about to take. From the check onward the name is held by
+    // `reservedNames`, then by the running row / the registry. Nothing awaits in
+    // between, so no name is ever momentarily unowned. The chain's LATER steps stay
+    // locked, so a generated name for this step still steps aside for them.
+    releaseStepNameLocks(chain, step.index);
 
     step.status = "running";
     chain.currentStep = step.index;
 
     // Default the step's name to the agent name, uniquified against running
-    // subagents, in-flight reservations, and the session's persistent
-    // registry (earlier chain steps live there). Reserve it synchronously
-    // (before any await) so parallel spawns can't collide.
+    // subagents, in-flight reservations, this session's chain handles and the names
+    // not-yet-started steps have reserved (a step may not answer to its own chain's
+    // name, nor to a name a later step of any chain already promises), and the
+    // session's persistent registry (earlier chain steps live there). Reserve it
+    // synchronously (before any await) so parallel spawns can't collide.
     //
     // Only a name THIS chain reserved may be released below: an explicit step
     // name was never ours to reserve, and `step.name` is later reassigned to
     // whatever the launch actually used — releasing that could hand a name a
-    // concurrent spawn is holding to someone else.
+    // concurrent spawn is holding to someone else. An explicit name is checked
+    // for collisions both here and in `startChain`, and that is not a duplicate:
+    // `startChain` rejects what is knowable at the tool call, while steps run one
+    // after another over minutes, so a name that was free then can be taken by a
+    // parallel spawn (or registered by one of this chain's own finished steps)
+    // before this step starts. This check is that race's backstop.
     let reservedStepName: string | null = null;
+    let stepNameConflict: string | null = null;
+    // Chain-side names of this session: this chain's own name and its siblings'. A
+    // step may not answer to one of those in either direction — a generated name
+    // steps aside, an explicit one is rejected — or the chain would be unreachable
+    // through the handle its caller chose once this step is running. The names
+    // pending steps promise are NOT listed here: the helpers below consult the
+    // reservations themselves, which is why a step cannot forget them.
+    const stepSessionId = ctx.sessionManager.getSessionId();
+    const stepSessionChains = getChainMapForSession(stepSessionId);
     if (!step.name) {
       const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
-      step.name = uniqueRunningName(step.agent, registryNames);
+      step.name = uniqueRunningName(step.agent, registryNames, stepSessionChains.keys(), stepSessionId);
       reservedStepName = step.name;
-      reservedNames.add(reservedStepName);
+      reservedNames.add(reservedStepName, stepSessionId);
+    } else {
+      step.name = step.name.trim();
+      const conflict =
+        findChainNameConflict(step.name, stepSessionChains, "chain step") ??
+        findNameConflict(step.name, parentArtifactDir, "chain step", stepSessionId);
+      if (conflict) {
+        stepNameConflict = conflict.message;
+      } else {
+        reservedStepName = step.name;
+        reservedNames.add(reservedStepName, stepSessionId);
+      }
     }
 
     try {
+      if (stepNameConflict) {
+        // The CHECK stays — a name free when the chain was accepted can be taken
+        // before this step runs — but it says nothing beyond the standard collision
+        // sentence. Which step failed is carried by the step's own state, not the text.
+        throw new Error(stepNameConflict);
+      }
       const taskForStep = buildChainStepTask(step.task, previous);
       // A single-step chain is not a chain: no context is threaded, so the step
       // launches exactly like an ordinary spawn (no block, no env vars).
@@ -1513,7 +1713,9 @@ async function runChain(
       step.status = "failed";
       step.errorMessage = err?.message ?? String(err);
     } finally {
-      if (reservedStepName) reservedNames.delete(reservedStepName);
+      // Released FOR THIS SESSION only — another session may be holding the very
+      // same name in its own launch, and its claim is not ours to cancel.
+      if (reservedStepName) reservedNames.delete(reservedStepName, stepSessionId);
     }
 
     if (step.status !== "completed") {
@@ -1530,6 +1732,11 @@ async function runChain(
   chain.currentRunning = null;
   chain.finished = true;
   chain.finishedAt = Date.now();
+  // The chain is over — completed, stopped early on a failed step, or aborted — so
+  // every name its remaining steps promised is released here, in one place, on the
+  // path that every terminal outcome goes through. A name must never stay spent
+  // because a chain ended.
+  releaseStepNameLocks(chain);
 
   const allCompleted = chain.steps.every((s) => s.status === "completed");
   try {
@@ -1638,25 +1845,116 @@ function startChain(
     ctx.sessionManager.getSessionDir(),
     ctx.sessionManager.getSessionId(),
   );
-  const sessionChains = getChainMapForSession(ctx.sessionManager.getSessionId());
+  const sessionId = ctx.sessionManager.getSessionId();
+  const sessionChains = getChainMapForSession(sessionId);
   const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
+  // Names held by other chains' steps that have not started. They are not in the
+  // running/reserved/registry sets yet (a step only claims its name when it
+  // launches), so without them a chain could be handed a name a sibling chain has
+  // already promised to a later step of its own. Read through the same reservations
+  // the central naming helpers consult — one source of truth, not a recomputation.
+  const promisedStepNames = lockedStepNames(sessionId);
   // Every name a subagent of this session already answers to: the running ones,
   // the ones claimed by parallel in-flight spawns, and the persistent registry.
   // subagent_message resolves running subagents BEFORE chains, so a chain handed
-  // such a name would be permanently unreachable through its own name — it must
-  // pick a different one. uniqueRunningName() already avoids the first three for
-  // the defaulted case; the loop re-checks all of them, which also means an
-  // explicit `name` is auto-suffixed on collision exactly the way a chain name
-  // already was when it collided with another chain.
+  // such a name would be permanently unreachable through its own name — an
+  // explicit one is now rejected outright and a defaulted one steps aside.
   const nameTaken = (candidate: string): boolean =>
     sessionChains.has(candidate) ||
+    promisedStepNames.has(candidate) ||
     registryNames.has(candidate) ||
-    reservedNames.has(candidate) ||
-    Array.from(runningSubagents.values()).some((r) => r.name === candidate);
-  const baseName = params.name?.trim() || uniqueRunningName("chain", registryNames);
-  let chainName = baseName;
-  let suffix = 2;
-  while (nameTaken(chainName)) chainName = `${baseName}-${suffix++}`;
+    reservedNames.has(candidate, sessionId) ||
+    Array.from(runningSubagents.values()).some((r) => nameRowVisibleTo(r, sessionId) && r.name === candidate);
+
+  // The chain's own handle. A name the CALLER supplied must be unique — the same
+  // policy as a spawn name or a step name — so a collision is REJECTED instead of
+  // silently suffixed: the caller would get a handle different from the one they
+  // type into subagent_message, and chains are matched by exact name. A name the
+  // SYSTEM generated because `name` was omitted keeps auto-suffixing (`chain`,
+  // `chain-2`, …) because parallel chains must never error. Every check below is
+  // followed immediately by the registration at the bottom of this function with
+  // no `await` in between — `startChain` is synchronous to that point, which is
+  // what makes two parallel chain calls safe.
+  const explicitChainName = params.name?.trim();
+  let chainName: string;
+  if (explicitChainName) {
+    const conflict =
+      findChainNameConflict(explicitChainName, sessionChains) ??
+      findNameConflict(explicitChainName, parentArtifactDir, "chain", sessionId);
+    if (conflict) {
+      return {
+        content: [{ type: "text", text: conflict.message }],
+        details: {
+          error: conflict.message,
+          name: explicitChainName,
+          kind: conflict.kind,
+          holder: conflict.holder,
+        },
+      };
+    }
+    chainName = explicitChainName;
+  } else {
+    // A DEFAULTED chain handle also avoids the names this chain's own steps would
+    // auto-generate (their explicit names, or their agents' names) — a chain that
+    // shared a handle with one of its own steps would be unreachable through it,
+    // since subagent_message resolves running subagents before chains. The other
+    // half of that invariant lives in `runChain`: a step's GENERATED name is
+    // uniquified against every chain handle, so neither side can take the other's.
+    const ownStepNames = new Set(
+      chainSteps.map((s) => (s.name?.trim() || String(s.agent ?? "").trim()).trim()).filter(Boolean),
+    );
+    chainName = "chain";
+    let suffix = 2;
+    while (nameTaken(chainName) || ownStepNames.has(chainName)) chainName = `chain-${suffix++}`;
+  }
+
+  // Caller-supplied STEP names are checked here against the FULL conflict set —
+  // running sub-agents, in-flight reservations, this session's registry, every
+  // chain handle (including this chain's own), and the names other chains have
+  // promised to their pending steps — because every one of those is knowable at
+  // this instant, and this function registers nothing before it returns. So a
+  // chain call either starts and runs, or is rejected here with the name, its kind,
+  // and the step it belongs to — the step index lives in `details.step`, never in
+  // the sentence. It never lands in the chain map, the registry or
+  // `reservedNames`, and never produces a chain that stops on its own name. A step named after its own chain (or after
+  // any other chain, or after another chain's pending step) would shadow that
+  // handle once it launched, and a step named after a sub-agent would take a
+  // handle that already addresses someone else.
+  //
+  // What this covers is exactly what is true NOW. Chain steps run one after
+  // another over minutes, so a name free here can be taken by a later spawn (or
+  // by one of this chain's own finished steps registering it) before step N runs;
+  // the identical check therefore also runs at each step's start — see `runChain`
+  // — as the race backstop, not as a duplicate of this one. That late collision is
+  // the only name failure a chain that was accepted can still have.
+  const explicitStepNames = new Set<string>();
+  for (let i = 0; i < chainSteps.length; i++) {
+    const stepName = chainSteps[i]?.name?.trim();
+    if (!stepName) continue;
+    const duplicate = explicitStepNames.has(stepName);
+    explicitStepNames.add(stepName);
+    const conflict: { kind: string; holder?: string; message?: string } | null = duplicate
+      ? { kind: "duplicate-step", holder: stepName }
+      : stepName === chainName
+        ? { kind: "own-chain-handle", holder: stepName }
+        : (findChainNameConflict(stepName, sessionChains, "chain step") ??
+            findNameConflict(stepName, parentArtifactDir, "chain step", sessionId));
+    if (conflict) {
+      // The text names only the KIND of name, the name, and that it is in use; WHICH
+      // step is at fault is for renderers and tests to read from `details.step`, not
+      // something to fish out of the sentence.
+      const message = nameInUseMessage(stepName, "chain step");
+      return {
+        content: [{ type: "text", text: message }],
+        details: {
+          error: message,
+          step: i + 1,
+          kind: conflict.kind,
+          ...(conflict.holder ? { holder: conflict.holder } : {}),
+        },
+      };
+    }
+  }
 
   const chain: ActiveChain = {
     name: chainName,
@@ -1678,36 +1976,68 @@ function startChain(
     abortController: new AbortController(),
   };
   sessionChains.set(chain.name, chain);
+  // Registering the chain and reserving its not-yet-started steps' explicit names
+  // happen in the same synchronous block, so a chain that exists has already made
+  // its future names untakeable — nothing has to remember to ask for them, and a
+  // rejected chain call (which returns above) locks nothing. Generated step names
+  // are deliberately NOT reserved: they are decided at launch and must keep
+  // auto-suffixing silently.
+  lockPendingStepNames(sessionId, chain);
 
-  startWidgetRefresh();
-  startStatusRefresh(pi);
+  // The kick-off is guarded because it happens AFTER the chain is registered and
+  // its names are locked: `runChain` itself cannot throw synchronously (it is an
+  // async function, so a throw inside it lands in the `catch` below), but the two
+  // timer starters above run before it and a throw there would leave a chain that
+  // never runs at all — never `finished`, never aborted, its steps forever
+  // `pending`, so even the read-time staleness check would call its locks live and
+  // spend those names for the process. Releasing here is the only thing that can
+  // stop that, and it is the reason `chain.finished` is set before rethrowing.
+  try {
+    startWidgetRefresh();
+    startStatusRefresh(pi);
 
-  // Fire-and-forget: the chain drives itself and reports via a steer message.
-  runChain(chain, ctx, parentArtifactDir, pi).catch((err) => {
-    // runChain handles step failures internally; this is a last resort.
-    if (!chain.finished) {
-      chain.finished = true;
-      chain.finishedAt = Date.now();
-    }
-    try {
-      pi.sendMessage(
-        {
-          customType: "subagent_result",
-          content: `Chain "${chain.name}" error: ${err?.message ?? String(err)}`,
-          display: true,
-          details: {
-            name: chain.name,
-            chain: true,
-            exitCode: 1,
-            steps: chainStepDetails(chain.steps),
+    // Fire-and-forget: the chain drives itself and reports via a steer message.
+    runChain(chain, ctx, parentArtifactDir, pi).catch((err) => {
+      // runChain handles step failures internally; this is a last resort.
+      if (!chain.finished) {
+        chain.finished = true;
+        chain.finishedAt = Date.now();
+      }
+      // Released UNCONDITIONALLY, not inside the `if`: a chain that is over must not
+      // keep names, and trusting `finished` alone would leak if anything ever set
+      // that flag on a path that skipped the release at the end of `runChain`.
+      // `releaseStepNameLocks` is identity-matched and idempotent, so releasing a
+      // chain that already released is a no-op for everyone else's entries.
+      releaseStepNameLocks(chain);
+      try {
+        pi.sendMessage(
+          {
+            customType: "subagent_result",
+            content: `Chain "${chain.name}" error: ${err?.message ?? String(err)}`,
+            display: true,
+            details: {
+              name: chain.name,
+              chain: true,
+              exitCode: 1,
+              steps: chainStepDetails(chain.steps),
+            },
           },
-        },
-        { triggerTurn: true, deliverAs: "steer" },
-      );
-    } catch {
-      /* session may be gone */
-    }
-  });
+          { triggerTurn: true, deliverAs: "steer" },
+        );
+      } catch {
+        /* session may be gone */
+      }
+    });
+  } catch (err) {
+    // Reached only if a timer starter throws before `runChain` was ever called — the
+    // one way a registered chain can end up with locks it will never release on its
+    // own. Close the chain out and free the names, then let the error go on exactly
+    // as it did before this guard existed.
+    chain.finished = true;
+    chain.finishedAt = Date.now();
+    releaseStepNameLocks(chain);
+    throw err;
+  }
 
   return {
     content: [
@@ -1744,9 +2074,24 @@ function getChainMapForSession(sessionId: string): Map<string, ActiveChain> {
 
 // ── Widget management ──
 
-/** Latest ExtensionContext from session_start, used for widget updates. */
+/**
+ * Latest ExtensionContext from session_start, used for widget updates, and the
+ * latest ExtensionAPI, used to deliver `ask_question` notifications from the
+ * watcher.
+ *
+ * Known limitation, deliberately left process-global: pi can host more than one
+ * session per process, and these two — unlike every name, chain and shutdown
+ * store above, which is keyed by spawner session — follow whichever runtime
+ * registered LAST. So the status widget lists every session's rows on ONE
+ * session's screen, and a child's `subagent_question` can be steered into a
+ * different session than the one that spawned it (the text still names its own
+ * sub-agent, and `subagent_message` resolves that name in the session that acts
+ * on it, so nothing is ever delivered to the wrong sub-agent — only the notification
+ * can land on the wrong screen). Making these per-session means keying the widget
+ * and the notification path by `parentSessionOf(row)`, which is item 5 of the
+ * session-scoping pass and is NOT done here.
+ */
 let latestCtx: ExtensionContext | null = null;
-/** Latest ExtensionAPI, used to deliver ask_question notifications from the watcher. */
 let latestPi: ExtensionAPI | null = null;
 
 /** Interval timer for widget re-renders. */
@@ -1947,7 +2292,7 @@ function buildSubagentToolAllowlist(
 function applySandboxToParts(
   parts: string[],
   loadout: SubagentLoadout,
-  opts: { artifactDir: string; name: string },
+  opts: { artifactDir: string; name: string; id?: string },
 ): void {
   if (loadout.model) {
     const model = loadout.thinking ? `${loadout.model}:${loadout.thinking}` : loadout.model;
@@ -1960,13 +2305,19 @@ function applySandboxToParts(
     .replace(/\s+/g, "-")
     .replace(/-+/g, "-")
     .replace(/^-|-$/g, "");
-  const writePromptFile = (kind: string, text: string): string => {
-    const stamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const path = join(opts.artifactDir, `context/${promptFileSuffix || "subagent"}-${kind}-${stamp}.md`);
-    mkdirSync(dirname(path), { recursive: true });
-    writeFileSync(path, text, "utf8");
-    return path;
-  };
+  // Per-launch unique path (the launch id is in the filename) — see
+  // launchArtifactPath(): a name+second path let a parallel launch overwrite
+  // this launch's system prompt before it was read.
+  const writePromptFile = (kind: string, text: string): string =>
+    writeArtifactExclusive(
+      launchArtifactPath(opts.artifactDir, {
+        dir: "context",
+        name: promptFileSuffix,
+        kind,
+        id: opts.id,
+      }),
+      text,
+    );
 
   // Chain position block (chain steps only). It rides on the identity's own
   // system-prompt call: when an identity exists it is appended to that text so
@@ -2082,8 +2433,252 @@ function observeRunningSubagent(running: RunningSubagent, observedAt = Date.now(
  * registers, so without this they'd all see an empty map and pick the same
  * name. Reserved synchronously when a default name is chosen and released once
  * the subagent registers (or its launch fails).
+ *
+ * The claim is remembered PER SPAWNER SESSION, like every other name store here:
+ * a launch in flight in session B must not reject a name in session A, nor make a
+ * generated name in A suffix. A reservation is held for the whole launch — pane
+ * creation included — so an unscoped set was a real cross-session false rejection,
+ * not just a theoretical one. An entry with no session (only a test can make one;
+ * every production `add` passes its id) is honoured by every session, the same
+ * conservative rule `nameRowVisibleTo` uses: an unattributable claim may be
+ * honoured, never stolen. Iteration stays process-wide so the widget/tests can
+ * still see everything; READERS pass a session id.
+ *
+ * Claims are stored as SESSION -> its claimed names, never as one owner slot per
+ * name. Session scoping makes two sessions reserving the SAME name concurrently
+ * legal, and a single slot would be overwritten by whichever reserved second —
+ * after which the first session's own next parallel spawn would read its own
+ * in-flight claim as free and take that name a second time: two same-named rows in
+ * one session, and `subagent_message` answering "Ambiguous subagent name" to a
+ * handle that was unique when it was chosen. Releasing is per session for the same
+ * reason: A's launch finishing must not silently cancel B's claim beside it.
  */
-const reservedNames = new Set<string>();
+class SessionReservedNames extends Set<string> {
+  /** spawner session id (null = unattributed) -> the names that session claims. */
+  private claims = new Map<string | null, Set<string>>();
+
+  private claimSet(sessionId: string | null): Set<string> {
+    let names = this.claims.get(sessionId);
+    if (!names) {
+      names = new Set();
+      this.claims.set(sessionId, names);
+    }
+    return names;
+  }
+
+  /** Which sessions currently claim `name` (null = an unattributed claim). */
+  private claimants(name: string): Array<string | null> {
+    const holders: Array<string | null> = [];
+    for (const [sessionId, names] of this.claims) if (names.has(name)) holders.push(sessionId);
+    return holders;
+  }
+
+  override add(name: string, sessionId?: string | null): this {
+    this.claimSet(sessionId ?? null).add(name);
+    return super.add(name);
+  }
+
+  /**
+   * Is this claim in force for `sessionId`? Only THIS session's claims and claims
+   * nobody can attribute are; another session's launch is not a conflict here (and
+   * with no `sessionId` the caller cannot be attributed, so every claim counts).
+   */
+  override has(name: string, sessionId?: string | null): boolean {
+    if (!super.has(name)) return false;
+    if (!sessionId) return true;
+    if (this.claims.get(null)?.has(name)) return true;
+    if (this.claims.get(sessionId)?.has(name)) return true;
+    // A union entry no session claims has no owner to scope it by — honoured, not
+    // stolen, exactly like a running row whose `parentSessionId` is missing.
+    return this.claimants(name).length === 0;
+  }
+
+  /**
+   * Release a claim. WITH a session id only that session's claim goes, and the
+   * name leaves the union only when no session holds it any more; WITHOUT one the
+   * caller cannot attribute the release, so the name is released everywhere (which
+   * is what the tests clean up with).
+   */
+  override delete(name: string, sessionId?: string | null): boolean {
+    if (sessionId === undefined) {
+      let removed = false;
+      for (const names of this.claims.values()) {
+        if (names.delete(name)) removed = true;
+      }
+      return super.delete(name) || removed;
+    }
+    const removed = this.claims.get(sessionId ?? null)?.delete(name) ?? false;
+    if (this.claimants(name).length === 0) super.delete(name);
+    return removed;
+  }
+
+  override clear(): void {
+    this.claims.clear();
+    super.clear();
+  }
+}
+
+const reservedNames = new SessionReservedNames();
+
+// ── Chain step-name reservations (the ONLY place step promises are consulted) ──
+
+/**
+ * A name a chain has PROMISED but not yet CLAIMED.
+ *
+ * A chain records its steps' explicit names the moment it starts, but a step only
+ * takes its name when it launches — minutes later. In between that name answers to
+ * nothing in `runningSubagents`, `reservedNames` or the registry, so the ordinary
+ * checks would call it free, and a newcomer that took it would make the chain's
+ * later step fail on the very name its caller chose. The promise therefore holds
+ * the name as a RESERVATION, and the two central naming helpers —
+ * `findNameConflict` (explicit names) and `uniqueRunningName` (generated names) —
+ * are its only readers. Naming call sites pass nothing chain-shaped and cannot
+ * forget to ask: asking happens inside the helpers.
+ *
+ * The map is keyed by SPAWNER SESSION ID, exactly like the chain map, and NOT put
+ * into the process-global `reservedNames`: a chain of session A must not spend a
+ * name in session B. Every production naming path passes its session id — the six
+ * call sites of `findNameConflict`/`uniqueRunningName` all do — and
+ * `unscopedStepNameLockReads` counts the times one did not, so a future site that
+ * forgets fails a test instead of silently going process-wide. A lookup with no
+ * session id cannot attribute the caller, and then assumes the whole process — the
+ * same assumption its running and in-flight-reservation checks already make.
+ *
+ * Leaks matter more than the rare steal: a leaked reservation spends a name for
+ * the process forever. So every lock carries the chain it belongs to, is released
+ * on every terminal path (step start, chain finish, early stop, abort, session
+ * shutdown), and is verified on READ — a lock whose chain is finished, aborted, or
+ * no longer sitting on a `pending` step is stale, so it is dropped and the name is
+ * free. A lock can therefore only ever outlive its usefulness for one lookup.
+ */
+type StepNameLock = { chain: ActiveChain; stepIndex: number };
+
+const stepNameLocks = new Map<string, Map<string, StepNameLock>>();
+
+/**
+ * How many times a reservation was consulted WITHOUT a session id. Every naming
+ * path in the extension knows its spawner session (all six call sites pass
+ * `ctx.sessionManager.getSessionId()`), so production must leave this at zero; an
+ * unscoped lookup is the one case where the check stops being session-scoped and
+ * honours the whole process, exactly like the running/`reservedNames` checks beside
+ * it. Exported only so a test can prove production never takes that branch.
+ */
+let unscopedStepNameLockReads = 0;
+
+function stepNameLockMapForSession(sessionId: string): Map<string, StepNameLock> {
+  let m = stepNameLocks.get(sessionId);
+  if (!m) {
+    m = new Map();
+    stepNameLocks.set(sessionId, m);
+  }
+  return m;
+}
+
+/**
+ * Reserve the explicit names of every step this chain has not started. Generated
+ * names are NOT locked: they are decided at launch time and must keep
+ * auto-suffixing silently. Call this only once a chain is really registered, so a
+ * rejected chain call never locks anything.
+ */
+function lockPendingStepNames(sessionId: string, chain: ActiveChain): void {
+  const map = stepNameLockMapForSession(sessionId);
+  for (const step of chain.steps ?? []) {
+    if (step.name && step.status === "pending") {
+      map.set(step.name, { chain, stepIndex: step.index });
+    }
+  }
+}
+
+/**
+ * Release this chain's reservations — all of them, or just one step's. Matched by
+ * chain IDENTITY, not by session id, so a caller that only has the chain (a
+ * teardown path, a `catch` that lost its ctx) can never miss, and so an entry a
+ * later chain took over under the same name is never dropped by mistake.
+ */
+function releaseStepNameLocks(chain: ActiveChain, stepIndex?: number): void {
+  for (const map of stepNameLocks.values()) {
+    for (const [name, lock] of map) {
+      if (lock.chain === chain && (stepIndex === undefined || lock.stepIndex === stepIndex)) {
+        map.delete(name);
+      }
+    }
+  }
+}
+
+/** Drop every reservation belonging to one session (used by `session_shutdown`). */
+function releaseStepNameLocksForSession(sessionId: string | null): void {
+  if (sessionId === null) stepNameLocks.clear();
+  else stepNameLocks.delete(sessionId);
+}
+
+/** A lock whose promise can no longer be kept: its chain never reaches the step. */
+function stepNameLockIsStale(lock: StepNameLock): boolean {
+  const chain = lock.chain;
+  if (!chain || chain.finished || chain.aborted || chain.abortController?.signal.aborted) return true;
+  const step = chain.steps?.find((s) => s.index === lock.stepIndex);
+  // Reaching the step transfers the name to the running row / the registry, and
+  // skipping it means the promise is off — either way the lock is spent.
+  return !step || step.status !== "pending";
+}
+
+/**
+ * The names currently held by a reservation, pruning stale entries as it reads.
+ * A `sessionId` of `undefined` means "whoever they are" — see
+ * `unscopedStepNameLockReads` for why production must never ask that.
+ */
+function lockedStepNames(sessionId: string | undefined): Set<string> {
+  if (sessionId === undefined) unscopedStepNameLockReads++;
+  const names = new Set<string>();
+  for (const [sid, map] of stepNameLocks) {
+    if (sessionId && sid !== sessionId) continue;
+    for (const [name, lock] of map) {
+      if (stepNameLockIsStale(lock)) map.delete(name);
+      else names.add(name);
+    }
+  }
+  return names;
+}
+
+/**
+ * The one sentence every name collision produces. An orchestrator needs the KIND
+ * of name, the name, and that it is in use — nothing else. Who holds it, why, and
+ * how to address it are `details` (kind/holder/step/error), which renderers and
+ * tests read; prose is not where that nuance belongs.
+ *
+ * `subject` is what the thing being named is called: "spawn" (a sub-agent name),
+ * "chain" (a chain handle) or "chain step" (a step's name).
+ */
+function nameInUseMessage(name: string, subject = "spawn"): string {
+  const kind =
+    subject === "chain" ? "Sub-agent chain name" : subject === "chain step" ? "Sub-agent chain step name" : "Sub-agent name";
+  return `${kind} "${name}" is already in use. Choose a different name.`;
+}
+
+/** A held name as a rejection message, or null when nothing reserves it. */
+function findStepNameLockConflict(
+  name: string,
+  sessionId: string | undefined,
+  subject = "spawn",
+): { kind: "pending-step"; holder: string; message: string } | null {
+  if (sessionId === undefined) unscopedStepNameLockReads++;
+  const requested = name.trim();
+  if (!requested) return null;
+  for (const [sid, map] of stepNameLocks) {
+    if (sessionId && sid !== sessionId) continue;
+    const lock = map.get(requested);
+    if (!lock) continue;
+    if (stepNameLockIsStale(lock)) {
+      map.delete(requested);
+      continue;
+    }
+    return {
+      kind: "pending-step",
+      holder: lock.chain.name,
+      message: nameInUseMessage(requested, subject),
+    };
+  }
+  return null;
+}
 
 /**
  * Return `base`, or `base-2`, `base-3`, … so the result is unique within this
@@ -2094,30 +2689,160 @@ const reservedNames = new Set<string>();
  * subagent of this session unambiguously, running or finished.
  *
  * `registryNames` is the set of names already taken in the registry (empty when
- * there is no session file / artifact dir yet).
+ * there is no session file / artifact dir yet). `extraTaken` adds whatever else
+ * the caller knows is spent — for chain steps and for spawns, this session's chain
+ * handles (a generated name that took one would shadow the chain: resolution tries
+ * running subagents first).
+ *
+ * Names held by a chain's not-yet-started steps are added HERE, not by the caller:
+ * every generated name in the extension steps aside for a promise without knowing
+ * that reservations exist. `sessionId` scopes that lookup to one spawner session;
+ * omitted means every session (see `lockedStepNames`).
  */
-function uniqueRunningName(base: string, registryNames?: Set<string>): string {
-  const taken = new Set(Array.from(runningSubagents.values()).map((r) => r.name));
-  for (const reserved of reservedNames) taken.add(reserved);
+function uniqueRunningName(
+  base: string,
+  registryNames?: Set<string>,
+  extraTaken?: Iterable<string>,
+  sessionId?: string,
+): string {
+  // Session-scoped like every other name store here: another session's sub-agent
+  // must not make a GENERATED name here suffix (see `nameRowVisibleTo`).
+  const taken = new Set(
+    Array.from(runningSubagents.values()).filter((r) => nameRowVisibleTo(r, sessionId)).map((r) => r.name),
+  );
+  for (const reserved of reservedNames) {
+    if (reservedNames.has(reserved, sessionId)) taken.add(reserved);
+  }
   if (registryNames) for (const n of registryNames) taken.add(n);
+  if (extraTaken) for (const n of extraTaken) taken.add(n);
+  for (const n of lockedStepNames(sessionId)) taken.add(n);
   if (!taken.has(base)) return base;
   let n = 2;
   while (taken.has(`${base}-${n}`)) n++;
   return `${base}-${n}`;
 }
 
-function resolveRunningByName(name: string):
+/**
+ * Is an EXPLICITLY chosen name already taken? Returns the reason it is not
+ * usable, or null when it is free.
+ *
+ * Policy: a name the caller typed is the caller's handle, so a collision is
+ * REJECTED rather than silently auto-suffixed (auto-suffixing would hand back a
+ * different handle than the one the caller will use with `subagent_message`, and
+ * `registerName` would quietly overwrite the previous holder's registry entry,
+ * costing that sub-agent its name-addressability). Only DEFAULTED names are
+ * suffixed — see `uniqueRunningName`.
+ *
+ * Three sources, in order of how urgent they are to report: a running
+ * sub-agent, a name claimed by a parallel spawn that is still mid-launch, a name a
+ * chain has promised to a step it has not reached, and this session's persistent
+ * registry (a finished sub-agent, reachable by name).
+ *
+ * `sessionId` scopes ALL FOUR of those to one spawner session, the way the chain
+ * map and the step-name reservations are scoped: two sessions in one process may
+ * each run a `worker`, and neither may be told its name is taken by the other.
+ * A row or reservation with no attributable owner is honoured by every session
+ * (see `nameRowVisibleTo`); with no `sessionId` the caller cannot be attributed,
+ * so the whole process is honoured — the same assumption the rest of the naming
+ * code makes.
+ *
+ * The chain reservation check lives HERE, not at the call sites: an explicit name
+ * is protected from a chain's promise wherever it comes from, and a call site that
+ * has never heard of chains cannot skip it. `sessionId` scopes that check the way
+ * the chain map is scoped; omitted means every session (see `lockedStepNames`).
+ *
+ * `subject` is what the error should call the thing being named ("spawn", "chain",
+ * "chain step") so the advice reads correctly; the caller-supplied-name policy is
+ * identical for all of them.
+ */
+function findNameConflict(
+  name: string,
+  parentArtifactDir: string,
+  subject = "spawn",
+  sessionId?: string,
+): { kind: "running" | "reserved" | "pending-step" | "registry"; holder?: string; message: string } | null {
+  const requested = name.trim();
+  if (!requested) return null;
+
+  const running = Array.from(runningSubagents.values()).filter(
+    (r) => r.name === requested && nameRowVisibleTo(r, sessionId),
+  );
+  if (running.length) {
+    return {
+      kind: "running",
+      holder: running[0].id,
+      message: nameInUseMessage(requested, subject),
+    };
+  }
+
+  if (reservedNames.has(requested, sessionId)) {
+    return {
+      kind: "reserved",
+      message: nameInUseMessage(requested, subject),
+    };
+  }
+
+  const heldByChain = findStepNameLockConflict(requested, sessionId, subject);
+  if (heldByChain) return heldByChain;
+
+  if (resolveNameInRegistry(parentArtifactDir, requested)) {
+    return {
+      kind: "registry",
+      message: nameInUseMessage(requested, subject),
+    };
+  }
+
+  return null;
+}
+
+/**
+ * Is a name already spent as a CHAIN handle in this session? Same policy as
+ * `findNameConflict` — a caller-supplied name is rejected, never renamed — but
+ * the source is the session's chain map rather than the sub-agent side. Chains
+ * are never pruned from that map, so a FINISHED chain's name stays spent: a
+ * later chain may not take it, and `subagent_message` keeps resolving it to the
+ * chain that had it (which answers with its steps, not with a new chain).
+ */
+function findChainNameConflict(
+  name: string,
+  sessionChains: Map<string, ActiveChain>,
+  subject = "chain",
+): { kind: "chain"; holder: string; message: string } | null {
+  const requested = name.trim();
+  const chain = sessionChains.get(requested);
+  if (!chain) return null;
+  return {
+    kind: "chain",
+    holder: chain.name,
+    message: nameInUseMessage(requested, subject),
+  };
+}
+
+/**
+ * The names PROMISED but not yet claimed now live as reservations — see
+ * `stepNameLocks` above — because a mechanism every naming path has to remember to
+ * call is a mechanism a future call site can forget. `lockedStepNames` and
+ * `findStepNameLockConflict` are the readers, and both are called from inside
+ * `uniqueRunningName` / `findNameConflict`.
+ */
+
+function resolveRunningByName(name: string, sessionId?: string | null):
   | { running: RunningSubagent }
-  | { error: string } {
+  | { error: string; ambiguous?: boolean } {
   const requestedName = name.trim();
   if (!requestedName) {
     return { error: "Provide the exact display name of a running subagent." };
   }
 
-  const matches = Array.from(runningSubagents.values()).filter((running) => running.name === requestedName);
+  // Session-scoped, like every name store in this extension: `runningSubagents` is
+  // process-global but names are only unique WITHIN a session, so two sessions that
+  // each run a `worker` must not make every lookup ambiguous. Ambiguity is still a
+  // hard error when this session really does have two rows under one name.
+  const visible = Array.from(runningSubagents.values()).filter((r) => nameRowVisibleTo(r, sessionId));
+  const matches = visible.filter((running) => running.name === requestedName);
   if (matches.length === 1) return { running: matches[0] };
   if (matches.length === 0) {
-    const names = Array.from(runningSubagents.values()).map((r) => r.name);
+    const names = visible.map((r) => r.name);
     const hint = names.length
       ? ` Currently running: ${[...new Set(names)].join(", ")}.`
       : " No subagents are currently running.";
@@ -2125,7 +2850,10 @@ function resolveRunningByName(name: string):
   }
 
   const candidates = matches.map((running) => `${running.name} [${running.id}]`).join(", ");
-  return { error: `Ambiguous subagent name "${requestedName}". Matches: ${candidates}` };
+  // `ambiguous` lets a caller tell "several rows answer to this name" apart from
+  // "none does" without string-matching the message: the first is a hard stop,
+  // the second is a reason to try the chain/registry paths.
+  return { error: `Ambiguous subagent name "${requestedName}". Matches: ${candidates}`, ambiguous: true };
 }
 
 /**
@@ -2236,6 +2964,7 @@ function deliverSubagentSteer(
 function handleSubagentSteer(
   params: { name?: string; message?: string },
   send: (surface: string, command: string) => void = sendCommand,
+  sessionId?: string | null,
 ) {
   const message = params.message?.trim();
   if (!message) {
@@ -2243,7 +2972,7 @@ function handleSubagentSteer(
     return { content: [{ type: "text" as const, text: err }], details: { error: err } };
   }
 
-  const resolved = resolveRunningByName(params.name ?? "");
+  const resolved = resolveRunningByName(params.name ?? "", sessionId);
   if ("error" in resolved) {
     return {
       content: [{ type: "text" as const, text: resolved.error }],
@@ -2368,8 +3097,23 @@ export const __test__ = {
   observeRunningSubagent,
   getToolExtensionPath,
   resolveRunningByName,
+  nameRowVisibleTo,
+  nameInUseMessage,
   deliverPendingQuestion,
   uniqueRunningName,
+  findNameConflict,
+  findChainNameConflict,
+  lockPendingStepNames,
+  releaseStepNameLocks,
+  releaseStepNameLocksForSession,
+  stepNameLockIsStale,
+  lockedStepNames,
+  findStepNameLockConflict,
+  stepNameLocks,
+  unscopedStepNameLockReads: () => unscopedStepNameLockReads,
+  launchArtifactPath,
+  writeArtifactExclusive,
+  artifactNameSlug,
   reservedNames,
   steerSubagent,
   handleSubagentSteer,
@@ -2384,6 +3128,7 @@ export const __test__ = {
   displayChainName,
   resolveResumeLaunchBehavior,
   runningSubagents,
+  parentSessionOf,
   formatElapsed,
   formatTokens,
   formatContextUsage,
@@ -2617,6 +3362,7 @@ async function launchSubagent(
       surface,
       startTime,
       sessionFile: subagentSessionFile,
+      parentSessionId: sessionId,
       launchScriptFile,
       cli: "claude",
       sentinelFile,
@@ -2682,7 +3428,7 @@ async function launchSubagent(
 
   // Apply model, identity, and the default-deny tool/extension restriction via
   // the shared helper (same code path resume uses — they can't drift).
-  applySandboxToParts(parts, loadout, { artifactDir, name: params.name });
+  applySandboxToParts(parts, loadout, { artifactDir, name: params.name, id });
 
   // Build env prefix: subagent identity + config dir propagation + spawn allowlist
   const envParts: string[] = [];
@@ -2726,18 +3472,8 @@ async function launchSubagent(
   if (launchBehavior.taskDelivery === "direct") {
     taskArg = fullTask;
   } else {
-    const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-    const safeName = params.name
-      .toLowerCase()
-      .replace(/[^a-z0-9\s-]/g, "") // strip everything except alphanumeric, spaces, hyphens
-      .replace(/\s+/g, "-") // spaces to hyphens
-      .replace(/-+/g, "-") // collapse multiple hyphens
-      .replace(/^-|-$/g, ""); // trim leading/trailing hyphens
-    const artifactName = `context/${safeName || "subagent"}-${timestamp}.md`;
-    const artifactPath = join(artifactDir, artifactName);
-    mkdirSync(dirname(artifactPath), { recursive: true });
-    writeFileSync(artifactPath, fullTask, "utf8");
-    taskArg = `@${artifactPath}`;
+    const artifactPath = launchArtifactPath(artifactDir, { dir: "context", name: params.name, id });
+    taskArg = `@${writeArtifactExclusive(artifactPath, fullTask)}`;
   }
 
   for (const promptArg of buildPiPromptArgs({
@@ -2779,6 +3515,7 @@ async function launchSubagent(
     surface,
     startTime,
     sessionFile: subagentSessionFile,
+    parentSessionId: sessionId,
     launchScriptFile,
     activityFile,
     interactive: effectiveInteractive,
@@ -2873,6 +3610,9 @@ function deliverPendingQuestion(running: RunningSubagent): void {
   running.lastNotifiedAsk = askKey;
 
   const name = running.name; // unique per session (deduped at spawn) — targets the reply
+  // NOTE: routed through `latestPi`, which is process-global — see the caveat at its
+  // declaration. The reply itself is resolved by the session that acts on it, so the
+  // name below always addresses the right sub-agent.
   const sessionId = existsSync(running.sessionFile) ? getSessionId(running.sessionFile) : null;
   const elapsed = Math.floor((Date.now() - running.startTime) / 1000);
   const replyHint = `\n\nReply with subagent_message({ name: "${name}", message: "…" }) — the same name works whether it is still running or has since exited. It stays open until you reply.`;
@@ -3031,9 +3771,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
   // Capture the UI context for widget updates
   pi.on("session_start", (_event, ctx) => {
     latestCtx = ctx;
-    // pi runs multiple sessions in one process. A prior session's shutdown
-    // aborts the shared module poll-abort controller; install a fresh one so
-    // subagents spawned in this session aren't watched against a dead signal.
+    // pi runs multiple sessions in one process. A shutdown that cannot attribute
+    // its session — or the last session in the process — aborts the shared module
+    // poll-abort controller; install a fresh one so subagents spawned in this
+    // session aren't watched against a dead signal.
     // See https://github.com/HazAT/pi-interactive-subagents/issues/5
     const prevAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
     if (!prevAbort || prevAbort.signal.aborted) {
@@ -3041,8 +3782,91 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     }
   });
 
-  // Clean up on session shutdown
-  pi.on("session_shutdown", (_event, _ctx) => {
+  // Clean up on session shutdown.
+  //
+  // pi can serve more than one session from one process, and every piece of
+  // state below is module-global: one flat `runningSubagents`, one
+  // `chainsBySession` (keyed by spawner session id), one widget/status timer
+  // pair, one module poll signal. So teardown is scoped by the id THIS handler
+  // was invoked for — reading the shared maps by position cancelled other
+  // sessions' chains and watchers and steered THEIR orchestrators with a
+  // "parent session shut down" message about a session that never shut down.
+  pi.on("session_shutdown", (_event, ctx) => {
+    let sessionId: string | null = null;
+    try {
+      sessionId = ctx?.sessionManager?.getSessionId?.() ?? null;
+    } catch {
+      // No id means we cannot tell our work from a stranger's.
+    }
+    // With no id the only safe reading of the shared state is "all of it":
+    // aborting everything is acceptable for an unattributed shutdown, while a
+    // KNOWN session must never abort a session it is not. A row that carries no
+    // owner at all counts as ours too, so it gets torn down rather than being
+    // mistaken for someone else's and left polling forever.
+    const isOurs = (owner: string | null) =>
+      sessionId === null || owner === null || owner === sessionId;
+
+    // This session's watchers. A row's own controller covers ordinary spawns
+    // and resumes; chain steps are watched through their CHAIN's signal, so the
+    // chains below have to be aborted as well or a step's poll loop survives.
+    // Removing the rows here matches what the old `clear()` did — the aborted
+    // watcher deletes its own row later, which is a no-op on an absent key.
+    for (const [id, agent] of runningSubagents) {
+      if (!isOurs(parentSessionOf(agent))) continue;
+      agent.abortController?.abort();
+      runningSubagents.delete(id);
+    }
+    // Chains are already partitioned by spawner session id, so this session's
+    // chains are exactly ONE map — not the outer `chainsBySession`, whose other
+    // entries belong to whoever else shares the process. (The comment here used
+    // to claim chains "belong to this session's process"; they don't.) Aborted
+    // chains still deliver their aggregate steer, which reports the cancellation.
+    const ownChainMaps = sessionId === null
+      ? Array.from(chainsBySession.values())
+      : [getChainMapForSession(sessionId)];
+    for (const chains of ownChainMaps) {
+      for (const chain of chains.values()) {
+        if (!chain.finished) {
+          chain.aborted = true;
+          chain.abortController.abort();
+        }
+      }
+    }
+    // ... and their step-name reservations go with them, so a name a chain of THIS
+    // session promised is not spent after the session is gone. Scoped by session id
+    // like the chain maps above — a stranger session's chains keep their promises
+    // (an unattributed shutdown is the case where everything counts as ours). The
+    // aborted chains' locks would already read as stale; dropping them here is what
+    // keeps the map itself from accumulating.
+    for (const chains of ownChainMaps) {
+      for (const chain of chains.values()) releaseStepNameLocks(chain);
+    }
+    releaseStepNameLocksForSession(sessionId);
+
+    // The two refresh timers and the module poll signal are process-global by
+    // design — ONE interval pair renders whatever ctx was captured last, and the
+    // poll signal is OR-ed into every watcher in the process — so they belong to
+    // the process, not to this session, and come down only once nothing else in
+    // the process still needs them. Clearing them because a stranger exited
+    // would freeze another session's widget and abort its watchers mid-poll (a
+    // fresh pair is re-armed by the next spawn either way). A whole-process exit
+    // still stops them: by then nothing of anyone else is left.
+    //
+    // A chain that is already aborted does NOT count as work needing the timers:
+    // `aborted`/`signal.aborted` are set synchronously by that chain's own
+    // teardown, while `finished` only turns true once `runChain` unwinds (async).
+    // In that window the dying chain would look like live work from a session that
+    // has already exited — and since no further `session_shutdown` will ever fire
+    // for it, the timers would stay armed forever and keep the process alive.
+    const needsTimers = (chain: ActiveChain) =>
+      !chain.finished && !chain.aborted && !chain.abortController.signal.aborted;
+    const otherWorkRunning =
+      Array.from(runningSubagents.values()).some((r) => !isOurs(parentSessionOf(r))) ||
+      Array.from(chainsBySession.entries()).some(
+        ([sid, chainMap]) => !isOurs(sid) && Array.from(chainMap.values()).some(needsTimers),
+      );
+    if (otherWorkRunning) return;
+
     if (widgetInterval) {
       clearInterval(widgetInterval);
       widgetInterval = null;
@@ -3055,21 +3879,6 @@ export default function subagentsExtension(pi: ExtensionAPI) {
     }
     const moduleAbort = (globalThis as any)[POLL_ABORT_KEY] as AbortController | undefined;
     if (moduleAbort) moduleAbort.abort();
-    for (const [_id, agent] of runningSubagents) {
-      agent.abortController?.abort();
-    }
-    runningSubagents.clear();
-    // Chains belong to this session's process too — abort any that are still
-    // running so their watchers stop (the aggregate steer, if it can still be
-    // delivered, reports the cancellation).
-    for (const sessionChains of chainsBySession.values()) {
-      for (const chain of sessionChains.values()) {
-        if (!chain.finished) {
-          chain.aborted = true;
-          chain.abortController.abort();
-        }
-      }
-    }
   });
 
   // The spawning tools are always registered here. Whether a child process can
@@ -3219,22 +4028,65 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         // every name already in the registry — so names stay unique across the
         // whole session, running or finished. Reserve the chosen name
         // synchronously (before any await) so parallel spawns don't collide.
+        // When the name was SUPPLIED instead, uniqueness is a precondition: a
+        // collision is rejected below, not renamed.
         let reservedName: string | null = null;
+        const spawnSessionId = ctx.sessionManager.getSessionId();
+        const spawnChains = getChainMapForSession(spawnSessionId);
         if (!params.name?.trim()) {
           const registryNames = new Set(Object.keys(readNameRegistry(parentArtifactDir)));
-          params.name = uniqueRunningName(params.agent, registryNames);
+          // A chain handle of this session is invisible to the running/reserved/
+          // registry sets, so it is handed in explicitly — a generated name that
+          // took one would shadow the chain and leave it unaddressable. The names
+          // this session's chains have promised to steps that have not started are
+          // added by `uniqueRunningName` itself, from the reservations.
+          params.name = uniqueRunningName(params.agent, registryNames, spawnChains.keys(), spawnSessionId);
           reservedName = params.name;
-          reservedNames.add(reservedName);
+          reservedNames.add(reservedName, spawnSessionId);
+        } else {
+          // An EXPLICIT name belongs to the caller: it is the handle they will
+          // use with subagent_message, so a collision is REJECTED, never quietly
+          // suffixed (and `registerName` would otherwise overwrite the previous
+          // holder's registry entry and cost that sub-agent its name).
+          // Chain handles count too — a chain of this session already answers to
+          // that name, and running subagents are resolved first, so sharing it
+          // would leave the chain unreachable through its own name.
+          // The check and the reservation are one synchronous block — no await in
+          // between — so two parallel explicit spawns of the same name cannot
+          // both pass: the loser finds the winner in `reservedNames`. Released in
+          // the `finally` below, exactly like the defaulted path.
+          const explicitName = params.name.trim();
+          const conflict =
+            findChainNameConflict(explicitName, spawnChains, "spawn") ??
+            findNameConflict(explicitName, parentArtifactDir, "spawn", spawnSessionId);
+          if (conflict) {
+            return {
+              content: [{ type: "text", text: conflict.message }],
+              details: {
+                error: conflict.message,
+                kind: conflict.kind,
+                ...(conflict.holder ? { holder: conflict.holder } : {}),
+              },
+            };
+          }
+          params.name = explicitName;
+          reservedName = explicitName;
+          reservedNames.add(reservedName, spawnSessionId);
         }
 
         // Launch the subagent (creates pane, sends command). Release the name
         // reservation once it registers in runningSubagents (or launch fails) —
         // from then on uniqueRunningName tracks it via the running map.
+        // Going through `subagentOps` (identical to the direct call by default,
+        // and what the chain step runner already uses) is what lets a test prove
+        // a rejected spawn launched nothing.
         let running;
         try {
-          running = await launchSubagent(params, ctx);
+          running = await subagentOps.launch(params, ctx);
         } finally {
-          if (reservedName) reservedNames.delete(reservedName);
+          // Released FOR THIS SESSION only — another session may be holding the very
+          // same name in its own launch, and its claim is not ours to cancel.
+          if (reservedName) reservedNames.delete(reservedName, spawnSessionId);
         }
 
         // Persist name → session so subagent_message({ name }) can resume this
@@ -3254,8 +4106,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         startWidgetRefresh();
         startStatusRefresh(pi);
 
-        // Fire-and-forget: start watching in background
-        watchSubagent(running, watcherAbort.signal)
+        // Fire-and-forget: start watching in background (same seam as `launch`,
+        // so a test that stubs the launch path can stub the watcher too).
+        subagentOps
+          .watch(running, watcherAbort.signal)
           .then((result) => {
             updateWidget(); // reflect removal from Map immediately
 
@@ -3575,10 +4429,22 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         }
 
         // ── Steer a running subagent ──
-        // A name that matches a currently-running subagent always steers it.
-        const runningMatch = Array.from(runningSubagents.values()).find((r) => r.name === requestedName);
+        // A name that matches a currently-running subagent always steers it —
+        // resolved through the SAME ambiguity-aware helper the steer itself
+        // uses. Picking `.find(...)` here let two rows that share a name be
+        // steered as "the first one", and let such an ambiguous name be answered
+        // with a chain-shadow note instead of the ambiguity error.
+        const resolution = resolveRunningByName(requestedName, ctx.sessionManager.getSessionId());
+        if ("error" in resolution && resolution.ambiguous) {
+          return { content: [{ type: "text", text: resolution.error }], details: { error: resolution.error } };
+        }
+        const runningMatch = "running" in resolution ? resolution.running : null;
         if (runningMatch) {
-          const steer = handleSubagentSteer({ name: requestedName, message: params.message });
+          const steer = handleSubagentSteer(
+            { name: requestedName, message: params.message },
+            sendCommand,
+            ctx.sessionManager.getSessionId(),
+          );
           // Resolution order is running → chain → registry, so a chain that was
           // given a name a subagent already answers to can never be reached
           // here. Steering the live subagent is still the right call — but the
@@ -3622,7 +4488,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
               `Try again in a moment, or wait for it.`;
             return { content: [{ type: "text" as const, text: err }], details: { error: "chain between steps" } };
           }
-          const steer = handleSubagentSteer({ name: current.name, message: params.message });
+          const steer = handleSubagentSteer(
+            { name: current.name, message: params.message },
+            sendCommand,
+            ctx.sessionManager.getSessionId(),
+          );
           if (steer.details?.error) return steer;
           return {
             content: [
@@ -3684,7 +4554,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         for (const r of runningSubagents.values()) {
           if (resolve(r.sessionFile) === resolve(sessionPath)) {
             const err = `Subagent "${requestedName}" is still running as "${r.name}". Your message will steer it; resending as a steer.`;
-            return handleSubagentSteer({ name: r.name, message: params.message });
+            return handleSubagentSteer(
+              { name: r.name, message: params.message },
+              sendCommand,
+              ctx.sessionManager.getSessionId(),
+            );
           }
         }
 
@@ -3724,23 +4598,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         mkdirSync(dirname(activityFile), { recursive: true });
 
         // Replay the model, identity, and default-deny tool/extension sandbox.
-        applySandboxToParts(parts, loadout, { artifactDir, name });
+        applySandboxToParts(parts, loadout, { artifactDir, name, id });
 
         let resumeMsgFile: string | undefined;
         if (params.message) {
-          const msgTimestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, 19);
-          resumeMsgFile = join(
-            artifactDir,
-            "subagent-resume",
-            `${name
-              .toLowerCase()
-              .replace(/[^a-z0-9\s-]/g, "")
-              .replace(/\s+/g, "-")
-              .replace(/-+/g, "-")
-              .replace(/^-|-$/g, "") || "resume"}-${msgTimestamp}.md`,
+          resumeMsgFile = writeArtifactExclusive(
+            launchArtifactPath(artifactDir, { dir: "subagent-resume", name, id, fallback: "resume" }),
+            message,
           );
-          mkdirSync(dirname(resumeMsgFile), { recursive: true });
-          writeFileSync(resumeMsgFile, message, "utf8");
           parts.push(shellEscape(`@${resumeMsgFile}`));
         }
 
@@ -3818,6 +4683,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           surface,
           startTime,
           sessionFile: sessionPath,
+          // The spawner doing the resume owns this row: `sessionPath` is the
+          // resumed sub-agent's own session (its id is `resumedSessionId`), so
+          // the owner can only come from ctx.
+          parentSessionId: sessionId,
           launchScriptFile,
           activityFile,
           interactive,

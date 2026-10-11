@@ -131,6 +131,62 @@ function restoreEnvVar(name: string, value: string | undefined) {
   process.env[name] = value;
 }
 
+/**
+ * Cancel and forget every chain a test registered. Chains live in one
+ * process-global map keyed by spawner session id, so a chain left behind stays
+ * addressable by later tests (and gets torn down by whichever test fires
+ * `session_shutdown` next). Clearing it keeps the chain tests order-independent.
+ * The step-name reservations go with them: a chain that no longer exists can keep
+ * no promises, and a forgotten reservation would spend a name for a later test.
+ */
+function clearChainsForTest() {
+  const testApi = (subagentsModule as any).__test__;
+  for (const chains of testApi.chainsBySession.values()) {
+    for (const chain of chains.values()) {
+      if (!chain.finished) {
+        chain.aborted = true;
+        chain.abortController.abort();
+      }
+    }
+  }
+  testApi.chainsBySession.clear();
+  testApi.stepNameLocks.clear();
+}
+
+/**
+ * Install launch stubs that FAIL LOUDLY instead of opening a pane. Stubbing
+ * `chainHooks.runStep` is what keeps a chain test off the real launch path —
+ * this makes that dependency explicit, so a test that ever reaches
+ * `subagentOps.launch`/`watch` (tmux IS available in CI) fails immediately
+ * instead of spawning a process. Returns the counter of attempted launches and
+ * the restore function for the test's `finally`.
+ */
+function forbidRealLaunches(): { calls: any[]; restore: () => void } {
+  const testApi = (subagentsModule as any).__test__;
+  const calls: any[] = [];
+  const origLaunch = testApi.subagentOps.launch;
+  const origWatch = testApi.subagentOps.watch;
+  testApi.subagentOps.launch = async (params: any) => {
+    calls.push(params);
+    throw new Error(`test must not launch ${params?.name} for real`);
+  };
+  testApi.subagentOps.watch = async () => {
+    throw new Error("test must not watch for real");
+  };
+  return {
+    calls,
+    restore: () => {
+      testApi.subagentOps.launch = origLaunch;
+      testApi.subagentOps.watch = origWatch;
+    },
+  };
+}
+
+/** Bounded wait used by the chain tests, which poll on a condition. */
+function chainSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
 function withMockedNow<T>(now: number, fn: () => T): T {
   const originalNow = Date.now;
   Date.now = () => now;
@@ -2093,6 +2149,33 @@ describe("subagent-done.ts", () => {
       });
     });
 
+    it("counts only the asking session's children when it names itself", () => {
+      // The publisher behind this symbol reads the PROCESS-GLOBAL row map, and one
+      // pi process can host several sessions — so an unscoped count let another
+      // session's children park this one's auto-exit forever.
+      const testApi = (subagentsModule as any).__test__;
+      const saved = new Map(testApi.runningSubagents);
+      const put = (row: any) => testApi.runningSubagents.set(row.id, row);
+      try {
+        testApi.runningSubagents.clear();
+        put({ id: "a1", name: "a1", parentSessionId: "sess-a" });
+        put({ id: "b1", name: "b1", parentSessionId: "sess-b" });
+        assert.equal(runningChildrenCount("sess-a"), 1, "only its own child");
+        assert.equal(runningChildrenCount("sess-b"), 1, "and the same for the other session");
+        assert.equal(runningChildrenCount(), 2, "with no id the whole map counts, as before");
+
+        // A row that cannot be attributed to anyone is counted everywhere: it
+        // might be this session's, and exiting while a child is live would strand
+        // it — the very thing this count exists to prevent.
+        put({ id: "orphan", name: "orphan" });
+        assert.equal(runningChildrenCount("sess-a"), 2, "an unattributable row still pins");
+        assert.equal(runningChildrenCount("sess-b"), 2);
+      } finally {
+        testApi.runningSubagents.clear();
+        for (const [id, row] of saved) testApi.runningSubagents.set(id, row);
+      }
+    });
+
     it("treats zero/negative/non-number/throwing getters as 0", () => {
       withGlobal(() => 0, () => assert.equal(runningChildrenCount(), 0));
       withGlobal(() => -1, () => assert.equal(runningChildrenCount(), 0));
@@ -2725,10 +2808,6 @@ describe("tool registration", () => {
 describe("subagent chain", () => {
   const testApi = (subagentsModule as any).__test__;
 
-  function chainSleep(ms: number): Promise<void> {
-    return new Promise((resolve) => setTimeout(resolve, ms));
-  }
-
   let sessionDir: string;
   let sessionId: string;
 
@@ -2745,17 +2824,23 @@ describe("subagent chain", () => {
     allowed: process.env.PI_SUBAGENT_ALLOWED,
   };
 
+  /** Installed by beforeEach so no chain test can reach a real launch. */
+  let launchGuard: { calls: any[]; restore: () => void };
+
   beforeEach(() => {
     sessionDir = createTestDir();
     sessionId = `sess-${Math.random().toString(36).slice(2)}`;
     delete process.env.PI_SUBAGENT_AGENT;
     delete process.env.PI_SUBAGENT_ALLOWED;
+    launchGuard = forbidRealLaunches();
   });
 
   afterEach(() => {
+    launchGuard?.restore();
     restoreEnvVar("PI_SUBAGENT_AGENT", saved.agent);
     restoreEnvVar("PI_SUBAGENT_ALLOWED", saved.allowed);
     testApi.stopTimersForTest();
+    clearChainsForTest();
     try {
       rmSync(sessionDir, { recursive: true, force: true });
     } catch {}
@@ -2785,6 +2870,54 @@ describe("subagent chain", () => {
     fake.statusState = createStatusState({ source: "pi", startTimeMs: fake.startTime });
     return fake;
   }
+
+  /**
+   * The api variant that REMEMBERS its handlers, so a test can fire
+   * `session_shutdown` for one chosen session ctx. pi registers one set of
+   * handlers per session runtime but the extension's sub-agent maps are shared
+   * by every session in the process — that combination is what the teardown has
+   * to survive.
+   */
+  function createCapturingApi() {
+    const mock = createMockExtensionApi();
+    const handlers = new Map<string, Array<(...args: any[]) => void>>();
+    mock.api.on = (event: string, handler: (...args: any[]) => void) => {
+      if (!handlers.has(event)) handlers.set(event, []);
+      handlers.get(event)!.push(handler);
+    };
+    const emit = (event: string, ...args: any[]) =>
+      (handlers.get(event) ?? []).forEach((h) => h(...args));
+    return { ...mock, emit };
+  }
+
+  /** A second, unrelated session sharing this process: its own id and artifact dir. */
+  function otherSession() {
+    const dir = createTestDir();
+    const id = `sess-${Math.random().toString(36).slice(2)}`;
+    return {
+      dir,
+      id,
+      ctx: {
+        sessionManager: {
+          getSessionFile: () => join(dir, "session.jsonl"),
+          getSessionId: () => id,
+          getSessionDir: () => dir,
+        },
+        cwd: dir,
+      } as any,
+    };
+  }
+
+  /**
+   * The process-global poll signal every watcher ORs into (index.ts
+   * POLL_ABORT_KEY). Aborting it stops every watcher in the process, so a
+   * teardown that leaves another session running must keep it live.
+   */
+  const modulePoll = () =>
+    (globalThis as any)[Symbol.for("pi-subagents/poll-abort-controller")] as AbortController;
+  const freshModulePoll = () => {
+    (globalThis as any)[Symbol.for("pi-subagents/poll-abort-controller")] = new AbortController();
+  };
 
   // ── buildChainStepTask: automatic output hand-off ──
 
@@ -3561,6 +3694,282 @@ describe("subagent chain", () => {
     }
   });
 
+  // ── Per-session teardown: one session's exit must not touch another's ──
+
+  it("attributes a running row to the session that launched it", () => {
+    // The launch-time id is the primary attribution (every spawn and resume path
+    // sets it); the artifact path is the fallback for a row that carries none.
+    assert.equal(testApi.parentSessionOf({ parentSessionId: "sess-a" } as any), "sess-a");
+    assert.equal(
+      testApi.parentSessionOf({
+        activityFile: join("/tmp/s", "artifacts", "sess-b", "subagent-activity", "abcd.json"),
+      } as any),
+      "sess-b",
+    );
+    // Launch-time id wins over the path when both are present.
+    assert.equal(
+      testApi.parentSessionOf({
+        parentSessionId: "sess-a",
+        activityFile: join("/x", "artifacts", "sess-b", "subagent-activity", "a.json"),
+      } as any),
+      "sess-a",
+    );
+    assert.equal(testApi.parentSessionOf({} as any), null, "unattributable");
+  });
+
+  it("aborts only the shutting-down session's sub-agent watchers", () => {
+    const { api, emit } = createCapturingApi();
+    (subagentsModule as any).default(api);
+    const other = otherSession();
+    freshModulePoll();
+
+    const rows = [
+      { name: "own-row", owner: sessionId },
+      { name: "stranger-row", owner: other.id },
+      { name: "orphan-row", owner: undefined },
+    ].map((spec) => {
+      const running = makeFakeRunning(spec.name);
+      if (spec.owner) running.parentSessionId = spec.owner;
+      const controller = new AbortController();
+      running.abortController = controller;
+      testApi.runningSubagents.set(running.id, running);
+      return { running, controller };
+    });
+    const [ownRow, strangerRow, orphanRow] = rows;
+    try {
+      emit("session_shutdown", { reason: "quit" }, { sessionManager: { getSessionId: () => sessionId } });
+
+      assert.ok(ownRow.controller.signal.aborted, "this session's watcher is aborted");
+      assert.ok(!testApi.runningSubagents.has(ownRow.running.id), "and its widget row is gone");
+      assert.ok(orphanRow.controller.signal.aborted, "an unattributable row is torn down too");
+      assert.ok(!testApi.runningSubagents.has(orphanRow.running.id));
+      assert.equal(strangerRow.controller.signal.aborted, false, "a stranger's watcher keeps running");
+      assert.ok(testApi.runningSubagents.has(strangerRow.running.id), "and its row stays in the map");
+      assert.equal(
+        modulePoll().signal.aborted,
+        false,
+        "the process-global poll signal stays live while another session still watches",
+      );
+
+      // Safe fallback: a shutdown that cannot name its session stops everything
+      // it can see — better than leaving work of unknown ownership polling.
+      emit("session_shutdown", { reason: "quit" }, {} as any);
+      assert.ok(strangerRow.controller.signal.aborted, "an unattributed shutdown aborts everything");
+      assert.equal(testApi.runningSubagents.size, 0, "and clears the map, as before");
+      assert.ok(modulePoll().signal.aborted, "including the module poll signal");
+    } finally {
+      testApi.runningSubagents.clear();
+      freshModulePoll();
+      rmSync(other.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("cancels only the shutting-down session's chains", async () => {
+    const { api, registeredTools, sentMessages, emit } = createCapturingApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((t) => t.name === "subagent");
+    const other = otherSession();
+    freshModulePoll();
+
+    let releaseOther: () => void;
+    const otherGate = new Promise<void>((r) => (releaseOther = r));
+    // Never settles: the step it gates ends only by abort, like a real step that
+    // runs until its session goes away.
+    const never = new Promise<void>(() => {});
+    const original = testApi.chainHooks.runStep;
+    const started: string[] = [];
+    testApi.chainHooks.runStep = async (
+      step: any,
+      _ctx: any,
+      _parentArtifactDir: any,
+      _pi: any,
+      signal: AbortSignal,
+      hooks: any,
+    ) => {
+      hooks.onLaunched(makeFakeRunning(step.name));
+      started.push(step.name);
+      if (step.name === "a1" || step.name === "b1") {
+        await Promise.race([
+          step.name === "b1" ? otherGate : never,
+          new Promise<void>((r) => signal.addEventListener("abort", () => r(), { once: true })),
+        ]);
+      }
+      return { name: step.name, summary: `S-${step.name}`, exitCode: 0, elapsed: 1 };
+    };
+    try {
+      const ackA = await subagentTool.execute(
+        "call-1",
+        {
+          name: "chain-a",
+          chain: [
+            { agent: "worker", task: "a1 task", name: "a1" },
+            { agent: "worker", task: "a2 task", name: "a2" },
+          ],
+        },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      const ackB = await subagentTool.execute(
+        "call-2",
+        {
+          name: "chain-b",
+          chain: [
+            { agent: "scout", task: "b1 task", name: "b1" },
+            { agent: "scout", task: "b2 task", name: "b2" },
+          ],
+        },
+        undefined,
+        undefined,
+        other.ctx,
+      );
+      assert.equal(ackA.details?.status, "chain-started");
+      assert.equal(ackB.details?.status, "chain-started", "the stranger's chain starts in its own session");
+
+      const chainA = testApi.getChainMapForSession(sessionId).get("chain-a");
+      const chainB = testApi.getChainMapForSession(other.id).get("chain-b");
+      assert.ok(chainA && chainB, "each chain lives in its own session's map");
+      for (let i = 0; i < 50 && !(chainA.currentStep === 1 && chainB.currentStep === 1); i++) {
+        await chainSleep(10);
+      }
+      assert.equal(chainA.currentStep, 1, "A's step 1 is running");
+      assert.equal(chainB.currentStep, 1, "B's step 1 is running");
+
+      // Session A shuts down; pi hands the handler A's ctx.
+      emit("session_shutdown", { reason: "quit" }, mockCtx());
+
+      assert.ok(chainA.aborted, "A's chain is cancelled");
+      assert.equal(chainB.aborted, false, "a stranger's shutdown must not cancel B's chain");
+      assert.equal(chainB.finished, false, "and B keeps running");
+      assert.equal(
+        modulePoll().signal.aborted,
+        false,
+        "B still needs the process-global poll signal, so it survives A's teardown",
+      );
+
+      for (let i = 0; i < 50 && !chainA.finished; i++) await chainSleep(10);
+      assert.ok(chainA.finished, "A's chain finalizes");
+      const steerA = sentMessages.find((m) => m.message?.content?.includes?.('Chain "chain-a"'));
+      assert.ok(steerA, "A's orchestrator gets the aggregate cancellation steer");
+      assert.equal(steerA.message.details.cancelled, true);
+      assert.match(steerA.message.content, /Chain "chain-a" was cancelled \(parent session shut down\)\./);
+      assert.equal(
+        sentMessages.filter((m) => m.message?.content?.includes?.("chain-b")).length,
+        0,
+        "nothing about B is steered on A's exit",
+      );
+
+      // B's watcher still completes, on its own terms.
+      releaseOther();
+      for (let i = 0; i < 100 && !chainB.finished; i++) await chainSleep(10);
+      assert.ok(chainB.finished, "B's chain still finishes after A shut down");
+      assert.equal(chainB.aborted, false, "and it was never marked cancelled");
+      assert.deepEqual(started, ["a1", "b1", "b2"], "B ran both of its steps; A never reached step 2");
+      const steerB = sentMessages.find((m) => m.message?.content?.includes?.('Chain "chain-b"'));
+      assert.ok(steerB, "B's orchestrator gets its own aggregate result");
+      assert.match(steerB.message.content, /Chain "chain-b" completed: 2\/2 steps/);
+    } finally {
+      releaseOther?.();
+      for (const chains of [testApi.getChainMapForSession(sessionId), testApi.getChainMapForSession(other.id)]) {
+        for (const chain of chains.values()) {
+          if (!chain.finished) {
+            chain.aborted = true;
+            chain.abortController.abort();
+          }
+        }
+      }
+      testApi.chainHooks.runStep = original;
+      testApi.runningSubagents.clear();
+      freshModulePoll();
+      rmSync(other.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still takes the shared timers down while a dead session's chain unwinds", async () => {
+    // The teardown gate must not count an ABORTED chain as work that needs the
+    // process-global timers. `aborted` is set synchronously by the owning
+    // session's shutdown; `finished` only turns true when `runChain` unwinds
+    // (async). The session that owns those timers has already exited, so no
+    // further shutdown will ever clear them — a lone armed interval would keep
+    // the whole process alive forever.
+    const { api, registeredTools, emit } = createCapturingApi();
+    (subagentsModule as any).default(api);
+    const other = otherSession();
+    freshModulePoll();
+
+    const original = testApi.chainHooks.runStep;
+    const never = new Promise<void>(() => {});
+    testApi.chainHooks.runStep = async (
+      step: any,
+      _ctx: any,
+      _parentArtifactDir: any,
+      _pi: any,
+      signal: AbortSignal,
+      hooks: any,
+    ) => {
+      hooks.onLaunched(makeFakeRunning(step.name));
+      await Promise.race([
+        never,
+        new Promise<void>((r) => signal.addEventListener("abort", () => r(), { once: true })),
+      ]);
+      await chainSleep(60); // unwinding takes a tick even after the abort
+      return { name: step.name, summary: `S-${step.name}`, exitCode: 0, elapsed: 1 };
+    };
+
+    // Our own watcher keeps the timers needed through the other session's exit —
+    // exactly what the previous test asserts must happen.
+    const ownRow = makeFakeRunning("own-row");
+    ownRow.parentSessionId = sessionId;
+    ownRow.abortController = new AbortController();
+    testApi.runningSubagents.set(ownRow.id, ownRow);
+    const subagentTool = registeredTools.find((t) => t.name === "subagent");
+    const statusTimer = () => (globalThis as any)[Symbol.for("pi-subagents/status-interval")] ?? null;
+
+    try {
+      await subagentTool.execute(
+        "call-1",
+        {
+          name: "chain-late",
+          chain: [
+            { agent: "scout", task: "b1 task", name: "late-1" },
+            { agent: "scout", task: "b2 task", name: "late-2" },
+          ],
+        },
+        undefined,
+        undefined,
+        other.ctx,
+      );
+      const chain = testApi.getChainMapForSession(other.id).get("chain-late");
+      assert.ok(chain, "the stranger's chain is registered in its own session");
+      for (let i = 0; i < 50 && chain.currentStep !== 1; i++) await chainSleep(10);
+      assert.equal(chain.currentStep, 1, "its step 1 is running");
+      assert.ok(testApi.widgetRefreshActive(), "starting a chain armed the refresh timers");
+
+      // The other session exits while OUR watcher still needs the timers.
+      emit("session_shutdown", { reason: "quit" }, other.ctx);
+      assert.ok(chain.aborted, "its chain is cancelled");
+      assert.ok(testApi.widgetRefreshActive(), "our watcher still needs them, so they survive");
+      assert.equal(modulePoll().signal.aborted, false, "and so does the process poll signal");
+
+      // Our work ends, then we exit — inside the window where the cancelled chain
+      // is aborted but not yet finished.
+      testApi.runningSubagents.delete(ownRow.id);
+      assert.equal(chain.finished, false, "the cancelled chain is still unwinding");
+      emit("session_shutdown", { reason: "quit" }, mockCtx());
+
+      assert.equal(testApi.widgetRefreshActive(), false, "nothing is left to render");
+      assert.equal(statusTimer(), null, "and nothing is left to observe");
+      assert.ok(modulePoll().signal.aborted, "so the process-wide poll signal comes down");
+      assert.equal(ownRow.abortController.signal.aborted, false, "our watcher had already ended");
+    } finally {
+      testApi.chainHooks.runStep = original;
+      testApi.runningSubagents.clear();
+      freshModulePoll();
+      testApi.stopTimersForTest();
+      rmSync(other.dir, { recursive: true, force: true });
+    }
+  });
+
   // ── subagent_message addressing of chains ──
 
   it("reports a finished chain by name and points at its steps", async () => {
@@ -3863,13 +4272,15 @@ describe("subagent chain", () => {
 
   // ── Name-collision correctness ──
 
-  it("never hands a chain a name a subagent already answers to", async () => {
+  it("rejects a chain whose explicit name a subagent already answers to", async () => {
     const { api, registeredTools } = createMockExtensionApi();
     (subagentsModule as any).default(api);
     const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
 
+    const launchedSteps: string[] = [];
     const original = testApi.chainHooks.runStep;
     testApi.chainHooks.runStep = async (step: any, _ctx: any, parentArtifactDir: any) => {
+      launchedSteps.push(step.name);
       // Register like the real runner does: the registry is what makes a
       // FINISHED step's name still answer to subagent_message.
       registerName(parentArtifactDir, step.name, {
@@ -3882,9 +4293,9 @@ describe("subagent chain", () => {
     testApi.runningSubagents.set(running.id, running);
     try {
       // Resolution reaches running subagents first, so a chain named "worker"
-      // could never be reached through its own name — it must take a free one.
-      // An explicit `name` used to bypass every check, which is what made this
-      // reachable at all.
+      // could never be reached through its own name. A name the CALLER supplied
+      // is therefore REJECTED rather than auto-suffixed: a `worker-2` handle is
+      // not the handle the caller would type into subagent_message.
       const clash = await subagentTool.execute(
         "call-1",
         {
@@ -3898,28 +4309,61 @@ describe("subagent chain", () => {
         undefined,
         mockCtx(),
       );
-      assert.equal(clash.details?.chainName, "worker-2", "the chain yields to the running subagent");
-      const chains = testApi.getChainMapForSession(sessionId);
-      assert.ok(chains.has("worker-2"), "and it is registered under the free name");
-      for (let i = 0; i < 50 && !chains.get("worker-2")?.finished; i++) await chainSleep(10);
+      assert.equal(
+        clash.content[0].text,
+        'Sub-agent chain name "worker" is already in use. Choose a different name.',
+        "one terse sentence: kind of name, the name, in use",
+      );
+      assert.equal(clash.details?.error, clash.content[0].text, "details.error is the same sentence");
+      assert.equal(clash.details?.kind, "running", "who holds it moved into details");
+      assert.ok(clash.details?.holder, "and the holder id is there too");
+      assert.equal(clash.details?.chainName, undefined, "no chain handle was handed out");
+      assert.equal(testApi.getChainMapForSession(sessionId).size, 0, "nothing was registered");
+      assert.deepEqual(launchedSteps, [], "and nothing was launched");
 
-      // Same for a name a finished subagent still answers to via the registry.
-      const registryClash = await subagentTool.execute(
+      // Build the registry entry the next case collides with: a chain whose
+      // steps finished, so their names stay addressable via the registry.
+      const filled = await subagentTool.execute(
         "call-2",
         {
-          name: "step-a",
           chain: [
-            { agent: "scout", task: "c", name: "step-c" },
-            { agent: "scout", task: "d", name: "step-d" },
+            { agent: "scout", task: "c", name: "step-a" },
+            { agent: "scout", task: "d", name: "step-b" },
           ],
         },
         undefined,
         undefined,
         mockCtx(),
       );
-      assert.equal(registryClash.details?.chainName, "step-a-2");
-      assert.ok(chains.has("step-a-2"));
-      for (let i = 0; i < 50 && !chains.get("step-a-2")?.finished; i++) await chainSleep(10);
+      assert.equal(filled.details?.chainName, "chain", "a DEFAULTED chain name still auto-suffixes freely");
+      const done = testApi.getChainMapForSession(sessionId).get("chain");
+      for (let i = 0; i < 50 && done && !done.finished; i++) await chainSleep(10);
+      assert.ok(done?.finished, "the chain that supplied the names finished");
+      assert.deepEqual(launchedSteps, ["step-a", "step-b"]);
+
+      // Same for a name a FINISHED subagent still answers to via the registry —
+      // this used to be suffixed to `step-a-2`.
+      const registryClash = await subagentTool.execute(
+        "call-3",
+        {
+          name: "step-a",
+          chain: [
+            { agent: "scout", task: "e", name: "step-c" },
+            { agent: "scout", task: "f", name: "step-d" },
+          ],
+        },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(
+        registryClash.content[0].text,
+        'Sub-agent chain name "step-a" is already in use. Choose a different name.',
+      );
+      assert.equal(registryClash.details?.kind, "registry", "the registry is the holder, and details says so");
+      assert.equal(testApi.getChainMapForSession(sessionId).size, 1, "still only the one chain");
+      assert.deepEqual(launchedSteps, ["step-a", "step-b"], "the rejected chain launched nothing of its own");
+      assert.equal(launchGuard.calls.length, 0, "no real launch happened anywhere in this test");
     } finally {
       for (const chain of testApi.getChainMapForSession(sessionId).values()) {
         if (!chain.finished) {
@@ -3928,6 +4372,346 @@ describe("subagent chain", () => {
         }
       }
       testApi.runningSubagents.delete(running.id);
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  // ── Uniform uniqueness for caller-supplied names ──
+  //
+  // A name the CALLER typed is a handle wherever it appears: the `name` param of
+  // `subagent`, the chain-level `name`, and a chain step's `name`. A collision is
+  // always an error that says to pick another name. Only a name the SYSTEM
+  // generated because `name` was omitted auto-suffixes — parallel same-agent
+  // delegation depends on that. `beforeEach` makes every test in this suite fail
+  // loudly if it ever reaches `subagentOps.launch`, and each test below also
+  // stubs `chainHooks.runStep`, so not one of them can open a tmux pane or a
+  // process even though tmux IS available here.
+
+  it("rejects a second chain that wants the name of a chain that is still running", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const launches: string[] = [];
+    let releaseStep: (() => void) | undefined;
+    const gate = new Promise<void>((r) => (releaseStep = r));
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any, _ctx: any, _dir: any, _pi: any, signal: AbortSignal) => {
+      launches.push(step.name);
+      await Promise.race([
+        gate,
+        new Promise<void>((r) => signal.addEventListener("abort", () => r(), { once: true })),
+      ]);
+      return { name: step.name, summary: "S", exitCode: 0, elapsed: 1 };
+    };
+    try {
+      const first = await subagentTool.execute(
+        "call-1",
+        { name: "fix-auth", chain: [{ agent: "scout", task: "a" }, { agent: "scout", task: "b" }] },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(first.details?.chainName, "fix-auth");
+      const chainA = testApi.getChainMapForSession(sessionId).get("fix-auth");
+      assert.ok(chainA, "the first chain is registered under the name the caller chose");
+      for (let i = 0; i < 50 && chainA.currentStep === 0; i++) await chainSleep(10);
+      assert.equal(chainA.currentStep, 1, "step 1 of the first chain is running");
+
+      // The case `sessionChains.has(candidate)` used to handle by renaming — and
+      // which no test ever exercised, because nothing here used to error.
+      const second = await subagentTool.execute(
+        "call-2",
+        { name: "fix-auth", chain: [{ agent: "worker", task: "c" }, { agent: "worker", task: "d" }] },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(
+        second.content[0].text,
+        'Sub-agent chain name "fix-auth" is already in use. Choose a different name.',
+      );
+      assert.equal(second.details?.kind, "chain", "the holder's KIND is in details");
+      assert.equal(second.details?.holder, "fix-auth", "and so is the chain that holds it");
+      // The sentence used to list the holding chain's steps (`scout → scout`); that
+      // nuance is gone from the text, so the holder is read off the chain map.
+      assert.deepEqual(
+        testApi.getChainMapForSession(sessionId).get("fix-auth")?.steps.map((s: any) => s.agent),
+        ["scout", "scout"],
+        "and it is still the chain that holds the name",
+      );
+      assert.equal(second.details?.chainName, undefined, "no second chain handle was handed out");
+      assert.equal(testApi.getChainMapForSession(sessionId).size, 1, "only the first chain is registered");
+
+      // Release the gate FIRST, then settle on a bounded poll.
+      releaseStep?.();
+      for (let i = 0; i < 100 && !chainA.finished; i++) await chainSleep(10);
+      assert.ok(chainA.finished, "the first chain ran through unaffected");
+      assert.equal(launches.length, 2, "and it ran exactly its two steps");
+      assert.equal(launchGuard.calls.length, 0, "no pane and no process at any point");
+    } finally {
+      releaseStep?.();
+      const chainA = testApi.getChainMapForSession(sessionId).get("fix-auth");
+      if (chainA && !chainA.finished) {
+        chainA.aborted = true;
+        chainA.abortController.abort();
+      }
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("still auto-suffixes the chain names it generated itself", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any) => ({ name: step.name, summary: "S", exitCode: 0, elapsed: 1 });
+    try {
+      // Two parallel same-agent chains with NO `name`: the recommended way to
+      // chain, and it must keep working — a generated name suffixes, never errors.
+      const a = await subagentTool.execute(
+        "call-1",
+        { chain: [{ agent: "worker", task: "a" }, { agent: "reviewer", task: "b" }] },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      const b = await subagentTool.execute(
+        "call-2",
+        { chain: [{ agent: "worker", task: "c" }, { agent: "reviewer", task: "d" }] },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(a.details?.chainName, "chain");
+      assert.equal(b.details?.chainName, "chain-2", "a generated chain name suffixes instead of erroring");
+
+      const chains = testApi.getChainMapForSession(sessionId);
+      for (let i = 0; i < 100 && ![...chains.values()].every((c) => c.finished); i++) await chainSleep(10);
+      assert.deepEqual([...chains.keys()].sort(), ["chain", "chain-2"], "both chains are registered");
+      assert.ok([...chains.values()].every((c) => c.finished), "and both ran to the end");
+      assert.equal(launchGuard.calls.length, 0, "no pane and no process at any point");
+    } finally {
+      for (const chain of testApi.getChainMapForSession(sessionId).values()) {
+        if (!chain.finished) {
+          chain.aborted = true;
+          chain.abortController.abort();
+        }
+      }
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("never lets a chain and one of its own steps answer to the same handle", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const launches: string[] = [];
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any) => {
+      launches.push(step.name);
+      return { name: step.name, summary: "S", exitCode: 0, elapsed: 1 };
+    };
+    try {
+      // Chain handle `worker`, and a step whose GENERATED name would be `worker`
+      // too. subagent_message resolves running subagents before chains, so the
+      // step has to take a different name or the chain is unreachable by name.
+      const a = await subagentTool.execute(
+        "call-1",
+        { name: "worker", chain: [{ agent: "worker", task: "a" }, { agent: "reviewer", task: "b" }] },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(a.details?.chainName, "worker", "the chain keeps the name the caller chose");
+      const chain = testApi.getChainMapForSession(sessionId).get("worker");
+      for (let i = 0; i < 100 && chain && !chain.finished; i++) await chainSleep(10);
+      assert.ok(chain?.finished, "the chain ran");
+      assert.deepEqual(launches, ["worker-2", "reviewer"], "the generated step name steps aside");
+      assert.ok(!launches.includes("worker"), "no step shares the chain handle");
+
+      // A step NAMED after its own chain: two caller-supplied names, one handle.
+      const ownName = await subagentTool.execute(
+        "call-2",
+        {
+          name: "own-name",
+          chain: [{ agent: "scout", task: "c", name: "own-name" }, { agent: "scout", task: "d" }],
+        },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(
+        ownName.content[0].text,
+        'Sub-agent chain step name "own-name" is already in use. Choose a different name.',
+      );
+      assert.equal(ownName.details?.kind, "own-chain-handle", "but details still says why");
+      assert.equal(ownName.details?.step, 1, "and the caller learns which step");
+      assert.equal(testApi.getChainMapForSession(sessionId).has("own-name"), false, "rejected before registering");
+
+      // A step NAMED after another chain of this session — same story.
+      const otherChain = await subagentTool.execute(
+        "call-3",
+        { chain: [{ agent: "scout", task: "e", name: "worker" }, { agent: "scout", task: "f" }] },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(
+        otherChain.content[0].text,
+        'Sub-agent chain step name "worker" is already in use. Choose a different name.',
+      );
+      assert.equal(otherChain.details?.kind, "chain", "the chain handle is the holder, per details");
+
+      assert.deepEqual(launches, ["worker-2", "reviewer"], "neither rejected chain launched a step");
+      assert.equal(testApi.getChainMapForSession(sessionId).size, 1, "and neither was registered");
+      assert.equal(launchGuard.calls.length, 0, "no pane and no process at any point");
+    } finally {
+      for (const chain of testApi.getChainMapForSession(sessionId).values()) {
+        if (!chain.finished) {
+          chain.aborted = true;
+          chain.abortController.abort();
+        }
+      }
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("rejects a chain that gives two steps the same explicit name", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const launches: string[] = [];
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any) => {
+      launches.push(step.name);
+      return { name: step.name, summary: "S", exitCode: 0, elapsed: 1 };
+    };
+    try {
+      const result = await subagentTool.execute(
+        "call-1",
+        {
+          chain: [
+            { agent: "worker", task: "a", name: "dup" },
+            { agent: "worker", task: "b", name: "dup" },
+          ],
+        },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(
+        result.content[0].text,
+        'Sub-agent chain step name "dup" is already in use. Choose a different name.',
+      );
+      assert.equal(result.details?.kind, "duplicate-step", "the in-chain duplicate is still named in details");
+      assert.equal(result.details?.step, 2, "and so is which step is at fault");
+      assert.equal(result.details?.chainName, undefined, "nothing started");
+      assert.equal(testApi.getChainMapForSession(sessionId).size, 0, "and nothing was registered");
+      assert.deepEqual(launches, [], "or launched");
+      assert.equal(launchGuard.calls.length, 0, "no pane and no process at any point");
+    } finally {
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("keeps a finished chain's name spent", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any) => ({ name: step.name, summary: "S", exitCode: 0, elapsed: 1 });
+    try {
+      const first = await subagentTool.execute(
+        "call-1",
+        { name: "spent", chain: [{ agent: "scout", task: "a" }, { agent: "scout", task: "b" }] },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(first.details?.chainName, "spent");
+      const chains = testApi.getChainMapForSession(sessionId);
+      const done = chains.get("spent");
+      for (let i = 0; i < 100 && done && !done.finished; i++) await chainSleep(10);
+      assert.ok(done?.finished, "the chain finished");
+
+      // Finished chains are never pruned from the map, so the name is still spent
+      // — pinned here so it is a documented behaviour rather than a surprise.
+      const again = await subagentTool.execute(
+        "call-2",
+        { name: "spent", chain: [{ agent: "worker", task: "c" }, { agent: "worker", task: "d" }] },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(
+        again.content[0].text,
+        'Sub-agent chain name "spent" is already in use. Choose a different name.',
+      );
+      assert.equal(again.details?.kind, "chain", "a chain holds it, per details");
+      // "…a chain that already finished…" left the sentence; the two assertions
+      // below still pin that the FINISHED chain is what holds the name.
+      assert.equal(chains.size, 1, "still exactly one chain under that name");
+      assert.ok(chains.get("spent")?.finished, "and it is still the finished one");
+      assert.equal(launchGuard.calls.length, 0, "no pane and no process at any point");
+    } finally {
+      for (const chain of testApi.getChainMapForSession(sessionId).values()) {
+        if (!chain.finished) {
+          chain.aborted = true;
+          chain.abortController.abort();
+        }
+      }
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("rejects a spawn whose explicit name is a chain handle", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any) => ({ name: step.name, summary: "S", exitCode: 0, elapsed: 1 });
+    try {
+      const runningBefore = testApi.runningSubagents.size;
+      const chain = await subagentTool.execute(
+        "call-1",
+        { name: "chain-one", chain: [{ agent: "scout", task: "a" }, { agent: "scout", task: "b" }] },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(chain.details?.chainName, "chain-one");
+      const registered = testApi.getChainMapForSession(sessionId).get("chain-one");
+      for (let i = 0; i < 100 && registered && !registered.finished; i++) await chainSleep(10);
+
+      // A chain handle is a name in this session like any other: it is already
+      // reachable with subagent_message, so a spawn may not take it too.
+      const spawn = await subagentTool.execute(
+        "call-2",
+        { agent: "worker", task: "t", name: "chain-one" },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(
+        spawn.content[0].text,
+        'Sub-agent name "chain-one" is already in use. Choose a different name.',
+      );
+      assert.equal(spawn.details?.kind, "chain", "a chain handle is what holds it, per details");
+      assert.equal(launchGuard.calls.length, 0, "the rejected spawn created no pane and no process");
+      assert.equal(testApi.runningSubagents.size, runningBefore, "and registered nothing");
+    } finally {
+      for (const chain of testApi.getChainMapForSession(sessionId).values()) {
+        if (!chain.finished) {
+          chain.aborted = true;
+          chain.abortController.abort();
+        }
+      }
       testApi.chainHooks.runStep = original;
     }
   });
@@ -4031,34 +4815,2012 @@ describe("subagent chain", () => {
     (subagentsModule as any).default(api);
     const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
 
+    // Nonce-prefixed so neither name can clash with a holder from another suite,
+    // and so the up-front step-name check has something genuinely FREE to accept:
+    // this chain must actually RESERVE the step name, because the point of the
+    // test is which of the two names its `finally` is allowed to release.
+    const nonce = `rel${Math.random().toString(36).slice(2, 8)}`;
+    const chainName = `${nonce}-chain`;
+    const stepName = `${nonce}-step`;
+    const heldByOther = `${nonce}-other`;
+    const launches: string[] = [];
     const original = testApi.chainHooks.runStep;
-    testApi.chainHooks.runStep = async (step: any) => ({ name: step.name, summary: "S", exitCode: 0, elapsed: 1 });
-    // A name a concurrent spawn is holding. The chain step below is LAUNCHED
-    // under this very name (explicitly), and used to free it in its finally —
-    // letting the parallel spawn be overwritten while it was still in use.
-    testApi.reservedNames.add("scout");
+    // The runner reports a name DIFFERENT from the one the step was handed, which
+    // is what a real launch does when it ends up suffixing. `step.name` is then
+    // reassigned to a name this chain never reserved, and releasing THAT in the
+    // finally would free a name a concurrent spawn is holding — while the name
+    // this chain really did reserve leaked forever.
+    testApi.chainHooks.runStep = async (step: any) => {
+      launches.push(step.name);
+      return { name: heldByOther, summary: "S", exitCode: 0, elapsed: 1 };
+    };
+    // The name a parallel spawn is claiming right now (mid-launch, unregistered).
+    testApi.reservedNames.add(heldByOther);
     try {
-      await subagentTool.execute(
+      const ack = await subagentTool.execute(
         "call-1",
-        { chain: [{ agent: "scout", task: "a", name: "scout" }, { agent: "scout", task: "b" }] },
+        { name: chainName, chain: [{ agent: "scout", task: "a", name: stepName }] },
         undefined,
         undefined,
         mockCtx(),
       );
-      const chain = testApi.getChainMapForSession(sessionId).get("chain");
-      assert.ok(chain, "the chain defaulted a name of its own");
+      assert.equal(ack.details?.chainName, chainName);
+      const chain = testApi.getChainMapForSession(sessionId).get(chainName);
+      assert.ok(chain, "the chain is registered");
       for (let i = 0; i < 50 && !chain.finished; i++) await chainSleep(10);
 
-      assert.ok(testApi.reservedNames.has("scout"), "the other spawn's reservation survives");
-      assert.ok(!testApi.reservedNames.has("scout-2"), "the name this chain DID reserve is released");
+      assert.ok(chain.finished, "the step ran — its own name was free");
+      assert.deepEqual(launches, [stepName], "and it was handed the explicit name");
+      assert.equal(chain.steps[0].name, heldByOther, "but the launch reported a different name");
+      assert.ok(testApi.reservedNames.has(heldByOther), "the name it never reserved survives");
+      assert.ok(!testApi.reservedNames.has(stepName), "and the name it DID reserve is released");
+      assert.equal(launchGuard.calls.length, 0, "no pane and no process at any point");
     } finally {
-      const chain = testApi.getChainMapForSession(sessionId).get("chain");
+      const chain = testApi.getChainMapForSession(sessionId).get(chainName);
       if (chain && !chain.finished) {
         chain.aborted = true;
         chain.abortController.abort();
       }
-      testApi.reservedNames.delete("scout");
+      testApi.reservedNames.delete(heldByOther);
+      testApi.reservedNames.delete(stepName);
       testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("rejects a name that another chain's pending step already promises", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const launches: string[] = [];
+    let releaseStep: (() => void) | undefined;
+    const gate = new Promise<void>((r) => (releaseStep = r));
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any, _ctx: any, _dir: any, _pi: any, signal: AbortSignal) => {
+      launches.push(step.name);
+      await Promise.race([
+        gate,
+        new Promise<void>((r) => signal.addEventListener("abort", () => r(), { once: true })),
+      ]);
+      return { name: step.name, summary: "S", exitCode: 0, elapsed: 1 };
+    };
+    try {
+      const first = await subagentTool.execute(
+        "call-1",
+        {
+          name: "report",
+          chain: [{ agent: "scout", task: "a" }, { agent: "worker", task: "b", name: "finalize" }],
+        },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(first.details?.chainName, "report");
+      const chainA = testApi.getChainMapForSession(sessionId).get("report");
+      for (let i = 0; i < 50 && chainA && chainA.currentStep === 0; i++) await chainSleep(10);
+      assert.equal(chainA?.currentStep, 1, "step 1 is still running");
+      assert.equal(chainA?.steps[1].status, "pending");
+      assert.equal(chainA?.steps[1].name, "finalize", "step 2 already promises this name");
+
+      // A pending step's explicit name is a handle its caller is holding, so it is
+      // spent for every other caller — a chain name, another chain's step name, or
+      // a spawn name — even though nothing answers to it yet.
+      const attempts: Array<[string, any, string]> = [
+        [
+          "call-2",
+          { name: "finalize", chain: [{ agent: "worker", task: "c" }, { agent: "worker", task: "d" }] },
+          "chain",
+        ],
+        [
+          "call-3",
+          { chain: [{ agent: "worker", task: "e", name: "finalize" }, { agent: "worker", task: "f" }] },
+          "chain step",
+        ],
+        ["call-4", { agent: "worker", task: "g", name: "finalize" }, "spawn"],
+      ];
+      for (const [callId, params, subject] of attempts) {
+        const clash = await subagentTool.execute(callId, params, undefined, undefined, mockCtx());
+        const kindPhrase =
+          subject === "chain"
+            ? "Sub-agent chain name"
+            : subject === "chain step"
+              ? "Sub-agent chain step name"
+              : "Sub-agent name";
+        assert.equal(
+          clash.content[0].text,
+          `${kindPhrase} "finalize" is already in use. Choose a different name.`,
+          subject,
+        );
+        assert.equal(clash.details?.kind, "pending-step", `${subject}: a pending step holds the name`);
+        assert.equal(clash.details?.holder, "report", `${subject}: and the chain that promised it is named`);
+      }
+      assert.equal(testApi.getChainMapForSession(sessionId).size, 1, "nothing else was registered");
+      assert.equal(launchGuard.calls.length, 0, "no pane and no process at any point");
+
+      releaseStep?.();
+      for (let i = 0; i < 100 && !chainA?.finished; i++) await chainSleep(10);
+      assert.ok(chainA?.finished, "the chain holding the promise ran through unaffected");
+      assert.equal(chainA?.steps[1].name, "finalize", "and it got the name it promised");
+      assert.deepEqual(launches, ["scout", "finalize"], "and launched exactly its two steps");
+    } finally {
+      releaseStep?.();
+      for (const chain of testApi.getChainMapForSession(sessionId).values()) {
+        if (!chain.finished) {
+          chain.aborted = true;
+          chain.abortController.abort();
+        }
+      }
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("keeps a generated spawn name off a chain's handle", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    let releaseStep: (() => void) | undefined;
+    const gate = new Promise<void>((r) => (releaseStep = r));
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any, _ctx: any, _dir: any, _pi: any, signal: AbortSignal) => {
+      await Promise.race([
+        gate,
+        new Promise<void>((r) => signal.addEventListener("abort", () => r(), { once: true })),
+      ]);
+      return { name: step.name, summary: "S", exitCode: 0, elapsed: 1 };
+    };
+    try {
+      // A chain whose HANDLE is an agent name. Its own steps step aside for it,
+      // and so must an ordinary spawn whose generated name would land on it —
+      // otherwise the spawn would answer to the name the chain is addressed by.
+      const first = await subagentTool.execute(
+        "call-1",
+        { name: "worker", chain: [{ agent: "scout", task: "a" }, { agent: "scout", task: "b" }] },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(first.details?.chainName, "worker");
+      const chain = testApi.getChainMapForSession(sessionId).get("worker");
+      for (let i = 0; i < 50 && chain && chain.currentStep === 0; i++) await chainSleep(10);
+      assert.equal(chain?.currentStep, 1, "the chain is running step 1");
+
+      try {
+        // The stubbed launch throws on purpose, so this proves the name WITHOUT
+        // ever opening a pane — the attempted name is recorded in its arguments.
+        await subagentTool.execute("call-2", { agent: "worker", task: "t" }, undefined, undefined, mockCtx());
+        assert.fail("the launch stub must throw rather than open a pane");
+      } catch (err: any) {
+        assert.match(String(err?.message), /test must not launch/, "and nothing was launched for real");
+      }
+      assert.equal(launchGuard.calls.length, 1, "exactly one attempted launch, and it was refused");
+      assert.equal(launchGuard.calls[0].name, "worker-2", "the generated name stepped aside for the chain");
+      assert.ok(!testApi.reservedNames.has("worker-2"), "and the reservation was released");
+    } finally {
+      releaseStep?.();
+      for (const chain of testApi.getChainMapForSession(sessionId).values()) {
+        if (!chain.finished) {
+          chain.aborted = true;
+          chain.abortController.abort();
+        }
+      }
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("never gives a chain step a name its own later step promises", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const launches: string[] = [];
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any) => {
+      launches.push(step.name);
+      return { name: step.name, summary: "S", exitCode: 0, elapsed: 1 };
+    };
+    try {
+      // Step 2 carries an explicit name that step 1 would generate for itself.
+      // Without stepping aside, both steps run under `scout` — two rows, one
+      // handle, and the explicit name is the one the caller can address.
+      const ack = await subagentTool.execute(
+        "call-1",
+        { chain: [{ agent: "scout", task: "a" }, { agent: "scout", task: "b", name: "scout" }] },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(ack.details?.chainName, "chain", "the chain name is free of both step names");
+      const chain = testApi.getChainMapForSession(sessionId).get("chain");
+      for (let i = 0; i < 100 && chain && !chain.finished; i++) await chainSleep(10);
+
+      assert.ok(chain?.finished, "the chain ran to the end");
+      assert.deepEqual(
+        chain?.steps.map((s: any) => s.status),
+        ["completed", "completed"],
+        "every step completed",
+      );
+      assert.deepEqual(launches, ["scout-2", "scout"], "the generated name stepped aside for the promised one");
+      assert.equal(launchGuard.calls.length, 0, "no pane and no process at any point");
+    } finally {
+      for (const chain of testApi.getChainMapForSession(sessionId).values()) {
+        if (!chain.finished) {
+          chain.aborted = true;
+          chain.abortController.abort();
+        }
+      }
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+
+  it("keeps a generated chain name off a name a pending step promises", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    let releaseStep: (() => void) | undefined;
+    const gate = new Promise<void>((r) => (releaseStep = r));
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any, _ctx: any, _dir: any, _pi: any, signal: AbortSignal) => {
+      await Promise.race([
+        gate,
+        new Promise<void>((r) => signal.addEventListener("abort", () => r(), { once: true })),
+      ]);
+      return { name: step.name, summary: "S", exitCode: 0, elapsed: 1 };
+    };
+    try {
+      // A pending step's explicit name is spent even for a name the SYSTEM
+      // generates — a generated name suffixes instead of erroring, so the chain
+      // that made the promise is never contradicted.
+      const first = await subagentTool.execute(
+        "call-1",
+        { name: "slow", chain: [{ agent: "worker", task: "a" }, { agent: "scout", task: "b", name: "chain" }] },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(first.details?.chainName, "slow");
+      const chainA = testApi.getChainMapForSession(sessionId).get("slow");
+      for (let i = 0; i < 50 && chainA && chainA.currentStep === 0; i++) await chainSleep(10);
+      assert.equal(chainA?.steps[1].name, "chain", "step 2 promises the name `chain`");
+
+      const second = await subagentTool.execute(
+        "call-2",
+        { chain: [{ agent: "worker", task: "c" }, { agent: "reviewer", task: "d" }] },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(second.details?.chainName, "chain-2", "the generated chain name suffixed past it");
+      assert.equal(second.details?.error, undefined, "and did not error");
+      assert.equal(launchGuard.calls.length, 0, "no pane and no process at any point");
+    } finally {
+      releaseStep?.();
+      for (const chain of testApi.getChainMapForSession(sessionId).values()) {
+        if (!chain.finished) {
+          chain.aborted = true;
+          chain.abortController.abort();
+        }
+      }
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  // ── Structural step-name reservations (locked at chain start, not per call site) ──
+  //
+  // A chain's not-yet-started explicit step names are a RESERVATION that the two
+  // central naming helpers consult, so protection does not depend on a future call
+  // site remembering to ask. Names here are nonce-suffixed because `runningSubagents`
+  // and `reservedNames` are process-global and other suites fill them.
+
+  const nonce = () => Math.random().toString(36).slice(2, 8);
+  const lockMapOf = (id: string) => testApi.stepNameLocks.get(id) as Map<string, any> | undefined;
+
+  /** Start a two-step chain whose step 1 is gated, and wait until it is running. */
+  async function startGatedChainWith(
+    subagentTool: any,
+    callId: string,
+    chainName: string,
+    step2Name: string,
+    ctx: any,
+    gate: Promise<void>,
+  ) {
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any, _c: any, _d: any, _p: any, signal: AbortSignal) => {
+      await Promise.race([
+        gate,
+        new Promise<void>((r) => signal.addEventListener("abort", () => r(), { once: true })),
+      ]);
+      return { name: step.name, summary: "S", exitCode: 0, elapsed: 1 };
+    };
+    const ack = await subagentTool.execute(
+      callId,
+      {
+        name: chainName,
+        chain: [
+          { agent: "worker", task: "step one", name: `${chainName}-s1` },
+          { agent: "scout", task: "step two", name: step2Name },
+        ],
+      },
+      undefined,
+      undefined,
+      ctx,
+    );
+    assert.equal(ack.details?.status, "chain-started", "the chain was accepted");
+    const chain = testApi.getChainMapForSession(ctx.sessionManager.getSessionId()).get(chainName);
+    for (let i = 0; i < 50 && chain && chain.currentStep === 0; i++) await chainSleep(10);
+    assert.equal(chain?.currentStep, 1, "step 1 is running");
+    assert.equal(chain?.steps[1].status, "pending", "step 2 has not started");
+    return { chain, restore: () => { testApi.chainHooks.runStep = original; } };
+  }
+
+  it("locks a promised step name inside the helpers themselves, with no chain arguments", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const promised = `promised-${nonce()}`;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let started: any;
+    try {
+      started = await startGatedChainWith(subagentTool, "call-1", `lock-${nonce()}`, promised, mockCtx(), gate);
+
+      // THE CENTRALISATION PROOF: both helpers are called with NOTHING chain-shaped
+      // — no chain map, no promised-name list, not even a session id — and still
+      // refuse / step aside. A call site that has never heard of chains therefore
+      // cannot forget the protection.
+      const conflict = testApi.findNameConflict(promised, artifactDirOf());
+      assert.ok(conflict, "findNameConflict reports the promise on its own");
+      assert.equal(conflict.kind, "pending-step", "the promise is still identified in the result");
+      assert.equal(conflict.holder, started.chain.name, "and the chain that made it is the holder");
+      assert.equal(
+        conflict.message,
+        `Sub-agent name "${promised}" is already in use. Choose a different name.`,
+        "the caller only ever gets the one terse sentence",
+      );
+      assert.equal(
+        testApi.findNameConflict(`unheld-${nonce()}`, artifactDirOf()),
+        null,
+        "and an unheld name stays free",
+      );
+      assert.equal(testApi.uniqueRunningName(promised), `${promised}-2`, "generated names suffix past it");
+      const fresh = `unheld-${nonce()}`;
+      assert.equal(testApi.uniqueRunningName(fresh), fresh, "and a name nobody holds is used as-is");
+
+      // The reservation lives in a session-scoped map, keyed by step name.
+      assert.ok(lockMapOf(sessionId)?.has(promised), "the lock is a session-scoped entry");
+      assert.ok(!testApi.reservedNames.has(promised), "and it is NOT in the process-global set");
+    } finally {
+      release?.();
+      const chain = started?.chain;
+      for (let i = 0; i < 100 && chain && !chain.finished; i++) await chainSleep(10);
+      started?.restore();
+    }
+  });
+
+  it("releases a step's own lock when it starts, and keeps locking its later steps", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const later = `later-${nonce()}`;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let started: any;
+    try {
+      started = await startGatedChainWith(subagentTool, "call-1", `mid-${nonce()}`, later, mockCtx(), gate);
+      const own = `${started.chain.name}-s1`;
+
+      // Half one: the step that STARTED no longer holds a reservation — the running
+      // row and the registry own that name now (a real launch registers it in
+      // `reservedNames` synchronously, which the stubbed launch does not do). The
+      // map is inspected first, so this is the release happening, not a stale read
+      // quietly cleaning up behind a missing release.
+      assert.ok(!lockMapOf(sessionId)?.has(own), "its own lock is gone from the map");
+      assert.equal(testApi.findStepNameLockConflict(own, sessionId), null, "and it reads as free");
+
+      // Half two: the chain still locks everything it has not reached.
+      const held = testApi.findStepNameLockConflict(later, sessionId);
+      assert.ok(held, "the later step is still locked");
+      assert.equal(held.holder, started.chain.name, "and the lock still says which chain holds it");
+      assert.equal(
+        held.message,
+        `Sub-agent name "${later}" is already in use. Choose a different name.`,
+        "with one terse sentence for the caller",
+      );
+      assert.deepEqual([...(lockMapOf(sessionId)?.keys() ?? [])], [later], "exactly one entry remains");
+      assert.ok(testApi.lockedStepNames(sessionId).has(later), "and the helper sees it");
+
+      release();
+      for (let i = 0; i < 100 && !started.chain.finished; i++) await chainSleep(10);
+      assert.ok(started.chain.finished, "the chain ran to the end");
+      assert.deepEqual(
+        started.chain.steps.map((s: any) => s.name),
+        [own, later],
+        "and every step got its own name",
+      );
+      assert.equal(lockMapOf(sessionId)?.size ?? 0, 0, "finished → nothing left locked");
+    } finally {
+      release?.();
+      for (const chain of testApi.getChainMapForSession(sessionId).values()) {
+        if (!chain.finished) {
+          chain.aborted = true;
+          chain.abortController.abort();
+        }
+      }
+      started?.restore();
+    }
+  });
+
+  it("frees the remaining locked names when a chain is aborted mid-flight", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const later = `abort-later-${nonce()}`;
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let started: any;
+    try {
+      started = await startGatedChainWith(subagentTool, "call-1", `ab-${nonce()}`, later, mockCtx(), gate);
+      assert.ok(testApi.findStepNameLockConflict(later, sessionId), "locked while step 2 waits");
+
+      started.chain.aborted = true;
+      started.chain.abortController.abort();
+      // Even before the chain unwinds, an aborted chain cannot keep a promise — the
+      // read verifies the lock and calls it stale.
+      assert.ok(testApi.stepNameLockIsStale(lockMapOf(sessionId)!.get(later)), "reads as stale");
+
+      release();
+      for (let i = 0; i < 100 && !started.chain.finished; i++) await chainSleep(10);
+      assert.ok(started.chain.finished, "the aborted chain finalized");
+      assert.equal(started.chain.steps[1].status, "skipped", "its step 2 never ran");
+      // Checked straight off the map, BEFORE any lookup that would prune it: this is
+      // the release path doing its job, not the read verifying a leak away.
+      assert.equal(lockMapOf(sessionId)?.size ?? 0, 0, "nothing was left locked");
+      assert.equal(testApi.findStepNameLockConflict(later, sessionId), null, "its name is free again");
+
+      // The next spawn can take it: the call gets past every name check and only the
+      // launch stub stops it, which is what proves the name was accepted.
+      try {
+        await subagentTool.execute("call-2", { agent: "worker", task: "t", name: later }, undefined, undefined, mockCtx());
+        assert.fail("the launch stub must throw rather than open a pane");
+      } catch (err: any) {
+        assert.match(String(err?.message), /test must not launch/, "the name was not refused");
+      }
+      assert.equal(launchGuard.calls.length, 1, "exactly one attempted launch");
+      assert.equal(launchGuard.calls[0].name, later, "under the freed name");
+    } finally {
+      release?.();
+      for (const chain of testApi.getChainMapForSession(sessionId).values()) {
+        if (!chain.finished) {
+          chain.aborted = true;
+          chain.abortController.abort();
+        }
+      }
+      started?.restore();
+    }
+  });
+
+  it("frees later steps' locked names when a chain stops early on a failed step", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const later = `early-later-${nonce()}`;
+    const first = `early-first-${nonce()}`;
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any) => ({
+      name: step.name,
+      summary: "S",
+      // Step 1 fails, so the chain stops before it can ever use step 2's name.
+      exitCode: step.name === first ? 1 : 0,
+      elapsed: 1,
+    });
+    try {
+      const ack = await subagentTool.execute(
+        "call-1",
+        {
+          name: `early-${nonce()}`,
+          chain: [{ agent: "worker", task: "a", name: first }, { agent: "scout", task: "b", name: later }],
+        },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      const chain = testApi.getChainMapForSession(sessionId).get(ack.details.chainName);
+      for (let i = 0; i < 100 && chain && !chain.finished; i++) await chainSleep(10);
+      assert.ok(chain?.finished, "the chain stopped at step 1");
+      assert.equal(chain?.steps[1].status, "skipped", "step 2 never ran");
+      // Straight off the map, before a pruning read would hide a leak.
+      assert.equal(lockMapOf(sessionId)?.size ?? 0, 0, "nothing was left locked");
+      assert.equal(testApi.findStepNameLockConflict(later, sessionId), null, "so its name is released");
+
+      try {
+        await subagentTool.execute("call-2", { agent: "worker", task: "t", name: later }, undefined, undefined, mockCtx());
+        assert.fail("the launch stub must throw rather than open a pane");
+      } catch (err: any) {
+        assert.match(String(err?.message), /test must not launch/, "the freed name was accepted");
+      }
+      assert.equal(launchGuard.calls[0].name, later);
+    } finally {
+      for (const chain of testApi.getChainMapForSession(sessionId).values()) {
+        if (!chain.finished) {
+          chain.aborted = true;
+          chain.abortController.abort();
+        }
+      }
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("keeps a chain's locked step names inside its own session", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const other = otherSession();
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    let started: any;
+    try {
+      // Session A promises the agent name `worker` to its second step.
+      started = await startGatedChainWith(subagentTool, "call-1", "holder", "worker", mockCtx(), gate);
+
+      // Session B, EXPLICIT name: accepted, because B owes nothing to A's promise.
+      try {
+        await subagentTool.execute("call-2", { agent: "worker", task: "t", name: "worker" }, undefined, undefined, other.ctx);
+        assert.fail("the launch stub must throw rather than open a pane");
+      } catch (err: any) {
+        assert.match(String(err?.message), /test must not launch/, "not rejected on the name");
+      }
+      assert.equal(launchGuard.calls[0].name, "worker", "under the name it asked for");
+
+      // Session B, GENERATED name: no suffixing.
+      try {
+        await subagentTool.execute("call-3", { agent: "worker", task: "t" }, undefined, undefined, other.ctx);
+        assert.fail("the launch stub must throw rather than open a pane");
+      } catch (err: any) {
+        assert.match(String(err?.message), /test must not launch/);
+      }
+      assert.equal(launchGuard.calls[1].name, "worker", "a stranger's chain caused no suffix");
+      assert.equal(testApi.findNameConflict("worker", join(other.dir, "artifacts", other.id), "spawn", other.id), null);
+      assert.equal(testApi.uniqueRunningName("worker", undefined, undefined, other.id), "worker");
+
+      // Session A still owes the promise: rejected, and suffixed when generated.
+      const refused = await subagentTool.execute(
+        "call-4",
+        { agent: "worker", task: "t", name: "worker" },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(
+        refused.content[0].text,
+        'Sub-agent name "worker" is already in use. Choose a different name.',
+        "A still refuses, in the one terse sentence",
+      );
+      assert.equal(refused.details?.kind, "pending-step", "and details still names the promise");
+      try {
+        await subagentTool.execute("call-5", { agent: "worker", task: "t" }, undefined, undefined, mockCtx());
+        assert.fail("the launch stub must throw rather than open a pane");
+      } catch (err: any) {
+        assert.match(String(err?.message), /test must not launch/);
+      }
+      assert.equal(launchGuard.calls[2].name, "worker-2", "and A's generated name steps aside");
+    } finally {
+      release?.();
+      for (const chains of [testApi.getChainMapForSession(sessionId), testApi.getChainMapForSession(other.id)]) {
+        for (const chain of chains.values()) {
+          if (!chain.finished) {
+            chain.aborted = true;
+            chain.abortController.abort();
+          }
+        }
+      }
+      started?.restore();
+      rmSync(other.dir, { recursive: true, force: true });
+    }
+  });
+
+  // ── Cross-session name scoping ──
+  //
+  // `runningSubagents` is one process-global map while every OTHER name store — this
+  // session's registry, the chain map, the step-name reservations, and the in-flight
+  // spawn reservations — is per-session. If the running scan is not scoped the same
+  // way the two halves disagree: a chain fails MID-RUN on a name another session was
+  // freely handed (the incident that started this), and a name that is free here
+  // reads as taken there. Each test below pins one direction of that.
+
+  it("never fails a chain mid-run on a name another session already uses", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool: any) => tool.name === "subagent");
+    const other = otherSession();
+    const wanted = `xstep-${nonce()}`;
+    const chainName = `xchain-${nonce()}`;
+
+    // Session B has a LIVE sub-agent under the name A's later step wants — right
+    // now, visibly, in the process-global running map.
+    const bRow = makeFakeRunning(wanted);
+    bRow.parentSessionId = other.id;
+    testApi.runningSubagents.set(bRow.id, bRow);
+
+    const original = testApi.chainHooks.runStep;
+    const launches: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((r) => (release = r));
+    testApi.chainHooks.runStep = async (step: any, _c: any, _d: any, _p: any, signal: AbortSignal) => {
+      launches.push(step.name);
+      if (launches.length === 1) {
+        await Promise.race([
+          gate,
+          new Promise<void>((r) => signal.addEventListener("abort", () => r(), { once: true })),
+        ]);
+      }
+      return { name: step.name, summary: "S", exitCode: 0, elapsed: 1 };
+    };
+    try {
+      const ack = await subagentTool.execute(
+        "call-1",
+        {
+          name: chainName,
+          chain: [
+            { agent: "worker", task: "one", name: `${chainName}-s1` },
+            { agent: "worker", task: "two", name: wanted },
+          ],
+        },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(ack.details?.error, undefined, "a stranger session's row is no reason to refuse the chain");
+      const chain = testApi.getChainMapForSession(sessionId).get(chainName);
+      for (let i = 0; i < 50 && chain && chain.currentStep === 0; i++) await chainSleep(10);
+      assert.equal(chain?.currentStep, 1, "step 1 is running");
+
+      // Release the gate FIRST, then settle on a bounded poll.
+      release();
+      for (let i = 0; i < 200 && chain && !chain.finished; i++) await chainSleep(10);
+      assert.ok(chain?.finished, "the chain finished");
+      assert.deepEqual(launches, [`${chainName}-s1`, wanted], "step 2 started under the name it was given");
+      assert.equal(chain!.steps[1].status, "completed", "and ran — it did not stop on a collision");
+      assert.equal(chain!.steps[1].errorMessage, undefined, "no name failure anywhere");
+      assert.equal(testApi.runningSubagents.get(bRow.id)?.name, wanted, "B keeps its own row and name");
+      assert.equal(launchGuard.calls.length, 0, "no pane and no process at any point");
+    } finally {
+      release?.();
+      const chain = testApi.getChainMapForSession(sessionId).get(chainName);
+      if (chain && !chain.finished) {
+        chain.aborted = true;
+        chain.abortController.abort();
+      }
+      testApi.runningSubagents.delete(bRow.id);
+      testApi.chainHooks.runStep = original;
+      rmSync(other.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("lets a session take a name only another session's sub-agent holds", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool: any) => tool.name === "subagent");
+    const other = otherSession();
+
+    // Determinism: a row another suite left behind with NO owner is honoured by
+    // every session and would suffix on its own merits. Park such rows for the
+    // duration and put them back afterwards.
+    const parked: Array<[string, any]> = [];
+    for (const [id, row] of Array.from(testApi.runningSubagents) as Array<[string, any]>) {
+      if (row.name === "worker" && !testApi.parentSessionOf(row)) {
+        parked.push([id, row]);
+        testApi.runningSubagents.delete(id);
+      }
+    }
+
+    // Session B runs a `worker` — the name session A's agent would default to.
+    const bRow = makeFakeRunning("worker");
+    bRow.parentSessionId = other.id;
+    testApi.runningSubagents.set(bRow.id, bRow);
+    const aRow = makeFakeRunning("worker");
+    aRow.parentSessionId = sessionId;
+    try {
+      // A, EXPLICIT name: accepted — B's row is not A's conflict to honour.
+      try {
+        await subagentTool.execute("call-1", { agent: "worker", task: "t", name: "worker" }, undefined, undefined, mockCtx());
+        assert.fail("the launch stub must throw rather than open a pane");
+      } catch (err: any) {
+        assert.match(String(err?.message), /test must not launch/, "not rejected on the name");
+      }
+      assert.equal(launchGuard.calls[0].name, "worker", "under the name it asked for");
+
+      // A, GENERATED name: a stranger's sub-agent must cause no suffix.
+      try {
+        await subagentTool.execute("call-2", { agent: "worker", task: "t" }, undefined, undefined, mockCtx());
+        assert.fail("the launch stub must throw rather than open a pane");
+      } catch (err: any) {
+        assert.match(String(err?.message), /test must not launch/);
+      }
+      assert.equal(launchGuard.calls[1].name, "worker", "no suffix from another session's row");
+      assert.equal(testApi.uniqueRunningName("worker", undefined, undefined, sessionId), "worker", "free for A");
+      assert.equal(testApi.uniqueRunningName("worker", undefined, undefined, other.id), "worker-2", "taken for B");
+
+      // Within A the same name IS taken: rejected, and suffixed when generated.
+      testApi.runningSubagents.set(aRow.id, aRow);
+      const refused = await subagentTool.execute(
+        "call-3",
+        { agent: "worker", task: "t", name: "worker" },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(refused.content[0].text, 'Sub-agent name "worker" is already in use. Choose a different name.');
+      assert.equal(refused.details?.kind, "running", "and it is THIS session's row that holds it");
+      assert.equal(refused.details?.holder, aRow.id);
+      assert.equal(launchGuard.calls.length, 2, "the refused spawn launched nothing");
+      assert.equal(testApi.uniqueRunningName("worker", undefined, undefined, sessionId), "worker-2", "A now suffixes");
+    } finally {
+      testApi.runningSubagents.delete(bRow.id);
+      testApi.runningSubagents.delete(aRow.id);
+      for (const [id, row] of parked) testApi.runningSubagents.set(id, row);
+      rmSync(other.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("steers the calling session's row when two sessions run the same name", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const messageTool = registeredTools.find((tool: any) => tool.name === "subagent_message");
+    const other = otherSession();
+    // Both sessions run a `worker`; the name is nonce-suffixed only because
+    // `runningSubagents` is process-global and other suites fill it with plain
+    // "worker" rows that no session owns.
+    const name = `worker-${nonce()}`;
+
+    const rowA = makeFakeRunning(name);
+    rowA.parentSessionId = sessionId;
+    const rowB = makeFakeRunning(name);
+    rowB.parentSessionId = other.id;
+    testApi.runningSubagents.set(rowA.id, rowA);
+    testApi.runningSubagents.set(rowB.id, rowB);
+    try {
+      // The mechanism: session-scoped resolution sees ONE row each, not two.
+      const fromA = testApi.resolveRunningByName(name, sessionId);
+      const fromB = testApi.resolveRunningByName(name, other.id);
+      assert.equal(fromA.running?.id, rowA.id, "A addresses A's worker");
+      assert.equal(fromB.running?.id, rowB.id, "B addresses B's worker");
+      assert.equal(fromA.ambiguous, undefined, "and neither lookup is ambiguous");
+      assert.equal(fromB.ambiguous, undefined);
+      assert.ok(testApi.resolveRunningByName(name).ambiguous, "an unattributable lookup still reports ambiguity");
+
+      // The tool path end to end. Whether the write to the fake "%stub" surface
+      // succeeds depends on the machine, so assert WHO it acted on (`details.id`)
+      // rather than the wording — and that no ambiguity error was produced.
+      const a = await messageTool.execute("call-1", { name, message: "go" }, undefined, undefined, mockCtx());
+      assert.doesNotMatch(String(a.details?.error ?? ""), /Ambiguous subagent name/, "A is not blocked");
+      assert.equal(a.details?.id, rowA.id, "A steered A's row");
+      const b = await messageTool.execute("call-2", { name, message: "go" }, undefined, undefined, other.ctx);
+      assert.doesNotMatch(String(b.details?.error ?? ""), /Ambiguous subagent name/, "B is not blocked");
+      assert.equal(b.details?.id, rowB.id, "B steered B's row");
+    } finally {
+      testApi.runningSubagents.delete(rowA.id);
+      testApi.runningSubagents.delete(rowB.id);
+      rmSync(other.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps another session's in-flight spawn reservation out of this session's way", () => {
+    // The reservation a spawn holds while its launch is in flight used to be a
+    // process-global set: a launch in flight in B rejected (or suffixed) the same
+    // name in A for as long as B's pane was being created. It is per-session now,
+    // exactly like the row it turns into.
+    const other = otherSession();
+    const held = `midflight-${nonce()}`;
+    testApi.reservedNames.add(held, other.id);
+    try {
+      assert.equal(testApi.findNameConflict(held, join(sessionDir, "artifacts", sessionId), "spawn", sessionId), null);
+      assert.equal(testApi.uniqueRunningName(held, undefined, undefined, sessionId), held);
+      assert.equal(
+        testApi.findNameConflict(held, join(other.dir, "artifacts", other.id), "spawn", other.id)?.kind,
+        "reserved",
+        "while B still honours its own launch",
+      );
+      assert.equal(testApi.uniqueRunningName(held, undefined, undefined, other.id), `${held}-2`);
+      assert.ok(testApi.reservedNames.has(held), "and an unattributed lookup still sees the claim");
+    } finally {
+      testApi.reservedNames.delete(held);
+      rmSync(other.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("keeps BOTH sessions' reservations when two sessions claim one name mid-launch", () => {
+    // Session scoping makes two sessions reserving the SAME name at the same moment
+    // legal, so the store keys claims BY SESSION instead of remembering one owner per
+    // name. With a single owner slot the session that reserved second overwrote the
+    // first's owner — and release is keyed the same way, because A's launch finishing
+    // is not B's claim to drop.
+    const b = otherSession();
+    const c = otherSession();
+    const a = { id: sessionId, dir: sessionDir };
+    const name = `both-${nonce()}`;
+    const dirOf = (s: { id: string; dir: string }) => join(s.dir, "artifacts", s.id);
+    try {
+      testApi.reservedNames.add(name, a.id);
+      testApi.reservedNames.add(name, b.id);
+      assert.ok(testApi.reservedNames.has(name, a.id), "A's claim survives B taking the same name");
+      assert.ok(testApi.reservedNames.has(name, b.id), "and B's claim is in force too");
+      assert.equal(testApi.reservedNames.has(name, c.id), false, "and neither is a stranger's conflict");
+      assert.ok(testApi.reservedNames.has(name), "an unattributed lookup still sees the claim");
+      assert.equal(testApi.findNameConflict(name, dirOf(a), "spawn", a.id)?.kind, "reserved", "A honours its own launch");
+      assert.equal(testApi.findNameConflict(name, dirOf(b), "spawn", b.id)?.kind, "reserved", "and B honours its own");
+      assert.equal(testApi.findNameConflict(name, dirOf(c), "spawn", c.id), null, "while C sees a free name");
+      assert.equal(testApi.uniqueRunningName(name, undefined, undefined, c.id), name, "and C's generated name does not suffix");
+
+      testApi.reservedNames.delete(name, a.id);
+      assert.equal(testApi.reservedNames.has(name, a.id), false, "A released its own claim");
+      assert.ok(testApi.reservedNames.has(name, b.id), "and A's release left B's alone");
+      assert.ok(testApi.reservedNames.has(name), "so the name is still claimed in the process");
+
+      testApi.reservedNames.delete(name, b.id);
+      assert.equal(testApi.reservedNames.has(name), false, "and with the last claim gone it is free again");
+    } finally {
+      testApi.reservedNames.delete(name);
+      for (const s of [b, c]) rmSync(s.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("never hands one session the same name twice because another session reserved it", async () => {
+    // The consequence the keyed store exists to prevent: A asks for `name` and its
+    // launch is in flight; B asks for the same name (legal — the stores are scoped) and
+    // its `add` used to overwrite A's owner. A's NEXT parallel spawn then found no
+    // conflict and took the name a second time, so A ended up with two running rows
+    // under one handle: unique when it was chosen, ambiguous afterwards.
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool: any) => tool.name === "subagent");
+    const b = otherSession();
+    const name = `double-${nonce()}`;
+    const launched: Array<{ session: string; name: string }> = [];
+    const rows: any[] = [];
+    const spawned: Promise<unknown>[] = [];
+    let releaseA!: () => void;
+    const gateA = new Promise<void>((r) => (releaseA = r));
+    let releaseB!: () => void;
+    const gateB = new Promise<void>((r) => (releaseB = r));
+    let releaseWatchers!: () => void;
+    const watching = new Promise<void>((r) => (releaseWatchers = r));
+    const firstLaunchOf = new Map<string, boolean>();
+    const origLaunch = testApi.subagentOps.launch;
+    const origWatch = testApi.subagentOps.watch;
+    // The exact window a reservation covers: the name is chosen and the pane is NOT up
+    // yet, so `runningSubagents` knows nothing and only the reservation says it is spent.
+    testApi.subagentOps.launch = async (params: any, ctx: any) => {
+      const sid = ctx.sessionManager.getSessionId();
+      launched.push({ session: sid, name: params.name });
+      if (!firstLaunchOf.get(sid)) {
+        firstLaunchOf.set(sid, true);
+        await (sid === sessionId ? gateA : gateB);
+      }
+      const row = makeFakeRunning(params.name);
+      row.parentSessionId = sid;
+      testApi.runningSubagents.set(row.id, row);
+      rows.push(row);
+      return row;
+    };
+    testApi.subagentOps.watch = async (running: any, signal: AbortSignal) => {
+      await Promise.race([
+        watching,
+        new Promise<void>((r) => signal.addEventListener("abort", () => r(), { once: true })),
+      ]);
+      testApi.runningSubagents.delete(running.id);
+      return {
+        name: running.name,
+        task: running.task,
+        summary: "S",
+        exitCode: 0,
+        elapsed: 1,
+        sessionFile: running.sessionFile,
+      };
+    };
+    try {
+      spawned.push(
+        subagentTool.execute("call-1", { agent: "worker", task: "t", name }, undefined, undefined, mockCtx()).catch((e: any) => e),
+      );
+      spawned.push(
+        subagentTool.execute("call-2", { agent: "worker", task: "t", name }, undefined, undefined, b.ctx).catch((e: any) => e),
+      );
+      for (let i = 0; i < 100 && launched.length < 2; i++) await chainSleep(10);
+      assert.equal(launched.length, 2, "both sessions are mid-launch on the same name");
+
+      // A's next parallel spawn: A's OWN in-flight claim is what must refuse it.
+      const refused = await subagentTool.execute(
+        "call-3",
+        { agent: "worker", task: "t", name },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(
+        refused.content[0].text,
+        `Sub-agent name "${name}" is already in use. Choose a different name.`,
+      );
+      assert.equal(refused.details?.kind, "reserved", "refused by A's own launch, not by B's");
+      // A generated name in either session steps aside for its OWN claim.
+      assert.equal(testApi.uniqueRunningName(name, undefined, undefined, sessionId), `${name}-2`, "A suffixes");
+      assert.equal(testApi.uniqueRunningName(name, undefined, undefined, b.id), `${name}-2`, "and so does B");
+
+      releaseA();
+      releaseB();
+      await Promise.all(spawned);
+      const aRows = rows.filter((r) => testApi.parentSessionOf(r) === sessionId && r.name === name);
+      assert.equal(aRows.length, 1, "A holds exactly one running row under the name it chose");
+      assert.equal(testApi.resolveRunningByName(name, sessionId).running?.id, aRows[0]?.id);
+      assert.equal(testApi.resolveRunningByName(name, sessionId).ambiguous, undefined, "and A's handle is not ambiguous");
+      assert.equal(testApi.resolveRunningByName(name, b.id).ambiguous, undefined, "nor is B's");
+      assert.equal(launchGuard.calls.length, 0, "no pane and no process at any point");
+    } finally {
+      releaseWatchers?.();
+      releaseA?.();
+      releaseB?.();
+      await Promise.all(spawned.map((p) => p.catch(() => undefined)));
+      for (const row of rows) {
+        row.abortController?.abort();
+        testApi.runningSubagents.delete(row.id);
+      }
+      testApi.subagentOps.launch = origLaunch;
+      testApi.subagentOps.watch = origWatch;
+      rmSync(b.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("honours an unattributable running row in every session, and never steals it", () => {
+    const row = makeFakeRunning(`orphan-${nonce()}`);
+    testApi.runningSubagents.set(row.id, row);
+    const other = otherSession();
+    try {
+      assert.equal(testApi.parentSessionOf(row), null, "the row is attributable to nobody");
+      for (const sid of [sessionId, other.id]) {
+        const dir = sid === sessionId ? join(sessionDir, "artifacts", sessionId) : join(other.dir, "artifacts", other.id);
+        assert.equal(
+          testApi.findNameConflict(row.name, dir, "spawn", sid)?.kind,
+          "running",
+          "every session must honour it",
+        );
+        assert.equal(testApi.uniqueRunningName(row.name, undefined, undefined, sid), `${row.name}-2`, "and suffix past it");
+        assert.equal(testApi.resolveRunningByName(row.name, sid).running?.id, row.id, "and may address it");
+      }
+      assert.equal(testApi.runningSubagents.get(row.id)?.name, row.name, "the row keeps its name");
+    } finally {
+      testApi.runningSubagents.delete(row.id);
+      rmSync(other.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("still counts unattributable rows for every session's auto-exit", () => {
+    // Name scoping must not leak into the auto-exit count: a row of unknown owner
+    // is counted for everyone, because exiting while a child is live would strand
+    // it. Pinned here so the two session filters cannot be confused for one.
+    const count = (globalThis as any)[Symbol.for("pi-subagents/running-children-count")] as (s?: string) => number;
+    const other = otherSession();
+    const rows = [
+      makeFakeRunning(`mine-${nonce()}`),
+      makeFakeRunning(`theirs-${nonce()}`),
+      makeFakeRunning(`nobody-${nonce()}`),
+    ];
+    rows[0].parentSessionId = sessionId;
+    rows[1].parentSessionId = other.id;
+    for (const row of rows) testApi.runningSubagents.set(row.id, row);
+    try {
+      assert.equal(count(sessionId), 2, "its own child, plus the unattributable one");
+      assert.equal(count(other.id), 2, "and the same for the other session");
+      assert.equal(count(), 3, "with no id the whole map counts, as before");
+    } finally {
+      for (const row of rows) testApi.runningSubagents.delete(row.id);
+      rmSync(other.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("never consults the reservations without a session id from production code", async () => {
+    // The session-scoped invariant is only real if every naming path says WHO is
+    // asking — an unscoped lookup falls back to the whole process, like the running
+    // and `reservedNames` checks beside it. This pins that no production call site
+    // takes that fallback: a future site that forgets its session id fails here
+    // instead of quietly rejecting another session's names.
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any) => ({ name: step.name, summary: "S", exitCode: 0, elapsed: 1 });
+    const before = testApi.unscopedStepNameLockReads();
+    try {
+      // Every naming path at once: a chain with an explicit and a generated step
+      // name, an explicit spawn, and a generated spawn.
+      const ack = await subagentTool.execute(
+        "call-1",
+        {
+          chain: [
+            { agent: "worker", task: "a", name: `scoped-s1-${nonce()}` },
+            { agent: "scout", task: "b" },
+          ],
+        },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      const chain = testApi.getChainMapForSession(sessionId).get(ack.details.chainName);
+      for (let i = 0; i < 100 && chain && !chain.finished; i++) await chainSleep(10);
+      assert.ok(chain?.finished, "the chain ran, so both of its naming paths executed");
+
+      for (const [id, params] of [
+        ["call-2", { agent: "worker", task: "t", name: `scoped-sp-${nonce()}` }],
+        ["call-3", { agent: "worker", task: "t" }],
+      ] as Array<[string, any]>) {
+        try {
+          await subagentTool.execute(id, params, undefined, undefined, mockCtx());
+          assert.fail("the launch stub must throw rather than open a pane");
+        } catch (err: any) {
+          assert.match(String(err?.message), /test must not launch/, "the name was accepted");
+        }
+      }
+      assert.equal(
+        testApi.unscopedStepNameLockReads(),
+        before,
+        "no spawn or chain step consulted the reservations without a session id",
+      );
+
+      // And the counter really measures the CALLER, not a broken lookup: an explicit
+      // unscoped call still works (it is what the centralisation proof relies on) and
+      // is counted.
+      testApi.findNameConflict(`unscoped-${nonce()}`, artifactDirOf());
+      assert.equal(testApi.unscopedStepNameLockReads(), before + 1, "an unscoped findNameConflict is counted");
+      testApi.uniqueRunningName(`unscoped-${nonce()}`);
+      assert.equal(testApi.unscopedStepNameLockReads(), before + 2, "and so is an unscoped uniqueRunningName");
+    } finally {
+      for (const chain of testApi.getChainMapForSession(sessionId).values()) {
+        if (!chain.finished) {
+          chain.aborted = true;
+          chain.abortController.abort();
+        }
+      }
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("releases one session's step-name locks on session_shutdown, and no one else's", async () => {
+    const { api, registeredTools, emit } = createCapturingApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((t) => t.name === "subagent");
+    const other = otherSession();
+    freshModulePoll();
+    const aName = `a-later-${nonce()}`;
+    const bName = `b-later-${nonce()}`;
+    let releaseB!: () => void;
+    const bGate = new Promise<void>((r) => (releaseB = r));
+    // A's step never settles on its own: it ends only by abort, like a real step
+    // whose session goes away.
+    const never = new Promise<void>(() => {});
+    let startedA: any;
+    let startedB: any;
+    try {
+      startedA = await startGatedChainWith(subagentTool, "call-1", "chain-a", aName, mockCtx(), never);
+      startedB = await startGatedChainWith(subagentTool, "call-2", "chain-b", bName, other.ctx, bGate);
+
+      assert.ok(testApi.findStepNameLockConflict(aName, sessionId), "A locks its later step");
+      assert.ok(testApi.findStepNameLockConflict(bName, other.id), "B locks its own");
+
+      // A shuts down while its step 1 is still running — i.e. before `runChain`
+      // unwinds, so it is the shutdown sweep that must free the name.
+      emit("session_shutdown", { reason: "quit" }, mockCtx());
+
+      assert.ok(startedA.chain.aborted, "A's chain is cancelled");
+      assert.equal(startedB.chain.aborted, false, "B keeps running");
+      assert.equal(lockMapOf(sessionId)?.has(aName) ?? false, false, "A's lock is gone from the map");
+      assert.ok(lockMapOf(other.id)?.has(bName), "a stranger session's lock is untouched");
+      assert.ok(testApi.findStepNameLockConflict(bName, other.id), "and B still holds the name");
+      assert.equal(testApi.findStepNameLockConflict(aName, sessionId), null, "A's name is free");
+
+      // A spawn in A can take it immediately.
+      try {
+        await subagentTool.execute("call-3", { agent: "worker", task: "t", name: aName }, undefined, undefined, mockCtx());
+        assert.fail("the launch stub must throw rather than open a pane");
+      } catch (err: any) {
+        assert.match(String(err?.message), /test must not launch/, "the name was accepted in A");
+      }
+      assert.equal(launchGuard.calls[0].name, aName);
+
+      releaseB();
+      for (let i = 0; i < 100 && !startedB.chain.finished; i++) await chainSleep(10);
+      assert.ok(startedB.chain.finished, "B finished normally");
+      assert.equal(lockMapOf(other.id)?.size ?? 0, 0, "and released its own lock");
+    } finally {
+      releaseB?.();
+      for (const chains of [testApi.getChainMapForSession(sessionId), testApi.getChainMapForSession(other.id)]) {
+        for (const chain of chains.values()) {
+          if (!chain.finished) {
+            chain.aborted = true;
+            chain.abortController.abort();
+          }
+        }
+      }
+      startedA?.restore();
+      startedB?.restore();
+      testApi.runningSubagents.clear();
+      freshModulePoll();
+      rmSync(other.dir, { recursive: true, force: true });
+    }
+  });
+
+  it("frees the promised names when a chain loses its surface — abort WITHOUT `chain.aborted`", async () => {
+    // `onSurfaceLost` is the one teardown that aborts the chain's controller while
+    // leaving `chain.aborted` false (only an explicit cancel sets that flag), so it
+    // has to be proven on its own path rather than assumed to behave like an abort.
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const chainName = `lost-${nonce()}`;
+    const later = `lost-later-${nonce()}`;
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any, _c: any, _d: any, _p: any, _s: AbortSignal, hooks: any) => {
+      // Exactly what a real step does when its pane goes away, before it reports.
+      hooks?.onSurfaceLost?.();
+      return { name: step.name, summary: "S", exitCode: 0, elapsed: 1 };
+    };
+    try {
+      const ack = await subagentTool.execute(
+        "call-1",
+        {
+          name: chainName,
+          chain: [
+            { agent: "worker", task: "a", name: `${chainName}-s1` },
+            { agent: "scout", task: "b", name: later },
+          ],
+        },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      const chain = testApi.getChainMapForSession(sessionId).get(ack.details.chainName);
+      for (let i = 0; i < 100 && chain && !chain.finished; i++) await chainSleep(10);
+
+      assert.ok(chain?.finished, "the surface-lost chain finalized");
+      assert.equal(chain?.aborted, false, "and it aborted WITHOUT setting `aborted`");
+      assert.ok(chain!.abortController.signal.aborted, "but its signal IS aborted");
+      assert.equal(chain?.steps[0].status, "failed", "step 1 ended as a surface loss");
+      assert.equal(chain?.steps[1].status, "skipped", "step 2 never started");
+
+      // Straight off the map, before any pruning read could hide a leak: the chain-end
+      // release is what frees a surface-lost chain's promise.
+      assert.equal(lockMapOf(sessionId)?.size ?? 0, 0, "nothing was left locked");
+      assert.equal(testApi.findStepNameLockConflict(later, sessionId), null, "so its name is free");
+
+      try {
+        await subagentTool.execute("call-2", { agent: "worker", task: "t", name: later }, undefined, undefined, mockCtx());
+        assert.fail("the launch stub must throw rather than open a pane");
+      } catch (err: any) {
+        assert.match(String(err?.message), /test must not launch/, "the freed name was accepted");
+      }
+      assert.equal(launchGuard.calls[0].name, later, "and used for the launch");
+    } finally {
+      for (const chain of testApi.getChainMapForSession(sessionId).values()) {
+        if (!chain.finished) {
+          chain.aborted = true;
+          chain.abortController.abort();
+        }
+      }
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("releases the promised names when `runChain` itself throws", async () => {
+    // The last-resort `catch` in `startChain` is the only release for a chain that
+    // dies on an unexpected error, so the error has to be raised OUTSIDE a step's own
+    // try/catch — here, from the session id `runChain` reads at each step's start. The
+    // chain needs THREE steps: a step gives up its own lock the instant it starts, so
+    // with two steps there would be nothing left for the catch to release, and the
+    // test would pass without the release existing.
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+    const chainName = `boom-${nonce()}`;
+    const later = `boom-later-${nonce()}`;
+    const original = testApi.chainHooks.runStep;
+    const ctx = mockCtx();
+    const realGetSessionId = ctx.sessionManager.getSessionId();
+    let armed = false;
+    let liveAtThrow = false;
+    ctx.sessionManager.getSessionId = () => {
+      if (armed) {
+        // Record the state at the instant of the throw: step 3 has not started, so its
+        // lock is still LIVE there — nothing about it is stale, and only the release
+        // in the catch can free it.
+        liveAtThrow = lockMapOf(sessionId)?.has(later) ?? false;
+        throw new Error("session manager went away mid-chain");
+      }
+      return realGetSessionId;
+    };
+    testApi.chainHooks.runStep = async (step: any) => {
+      // Arm the failure only once step 1 is done, so it fires as step 2 begins.
+      armed = true;
+      return { name: step.name, summary: "S", exitCode: 0, elapsed: 1 };
+    };
+    try {
+      const ack = await subagentTool.execute(
+        "call-1",
+        {
+          name: chainName,
+          chain: [
+            { agent: "worker", task: "a", name: `${chainName}-s1` },
+            { agent: "scout", task: "b", name: `${chainName}-s2` },
+            { agent: "reviewer", task: "c", name: later },
+          ],
+        },
+        undefined,
+        undefined,
+        ctx,
+      );
+      const chain = testApi.getChainMapForSession(sessionId).get(ack.details.chainName);
+      for (let i = 0; i < 100 && chain && !chain.finished; i++) await chainSleep(10);
+
+      assert.ok(chain?.finished, "the chain that threw was closed out");
+      assert.equal(chain?.steps[2].status, "pending", "its third step never started");
+      assert.ok(liveAtThrow, "step 3's lock was still live when the throw happened");
+      // Straight off the map: nothing unwound `runChain`, so this is the throw path
+      // releasing — and the only path that could.
+      assert.equal(lockMapOf(sessionId)?.size ?? 0, 0, "nothing was left locked");
+      armed = false;
+      assert.equal(testApi.findStepNameLockConflict(later, sessionId), null, "so its name is free");
+
+      try {
+        await subagentTool.execute("call-2", { agent: "worker", task: "t", name: later }, undefined, undefined, ctx);
+        assert.fail("the launch stub must throw rather than open a pane");
+      } catch (err: any) {
+        assert.match(String(err?.message), /test must not launch/, "the freed name was accepted");
+      }
+      assert.equal(launchGuard.calls[0].name, later, "and used for the launch");
+    } finally {
+      armed = false;
+      for (const chain of testApi.getChainMapForSession(sessionId).values()) {
+        if (!chain.finished) {
+          chain.aborted = true;
+          chain.abortController.abort();
+        }
+      }
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("ignores and drops a stale step-name lock instead of honouring it", () => {
+    const dir = artifactDirOf();
+    const ghost = `ghost-${nonce()}`;
+    // A leaked entry, constructed by hand: the chain is FINISHED but its lock is
+    // still in the map. Honouring it would spend the name for the process forever.
+    const dead: any = {
+      name: `dead-${nonce()}`,
+      steps: [
+        { index: 1, agent: "worker", task: "a", name: `${ghost}-s1`, status: "completed" },
+        { index: 2, agent: "scout", task: "b", name: ghost, status: "pending" },
+      ],
+      currentStep: 0,
+      currentRunning: null,
+      startTime: Date.now(),
+      finished: true,
+      finishedAt: Date.now(),
+      aborted: false,
+      surfaceLost: false,
+      abortController: new AbortController(),
+    };
+    testApi.getChainMapForSession(sessionId).set(dead.name, dead);
+    testApi.lockPendingStepNames(sessionId, dead);
+    assert.ok(lockMapOf(sessionId)?.has(ghost), "the leaked entry exists");
+
+    assert.equal(testApi.findNameConflict(ghost, dir, "spawn", sessionId), null, "a finished chain is not honoured");
+    assert.ok(!lockMapOf(sessionId)?.has(ghost), "and the read dropped it");
+
+    // Same for a chain that is alive but whose step left `pending` — the name went
+    // to the running row / registry, so the lock is worthless.
+    const moved: any = { ...dead, name: `moved-${nonce()}`, finished: false, finishedAt: undefined };
+    moved.steps = moved.steps.map((s: any) => ({ ...s }));
+    moved.steps[1].name = `${ghost}-running`;
+    testApi.getChainMapForSession(sessionId).set(moved.name, moved);
+    testApi.lockPendingStepNames(sessionId, moved);
+    // The step started — a release that had been forgotten must still read as free.
+    moved.steps[1].status = "running";
+    assert.ok(lockMapOf(sessionId)?.has(`${ghost}-running`), "its lock was made");
+    assert.equal(
+      testApi.findNameConflict(`${ghost}-running`, dir, "spawn", sessionId),
+      null,
+      "a started step's lock reads as free",
+    );
+    assert.ok(testApi.stepNameLockIsStale({ chain: moved, stepIndex: 2 }), "and is called stale");
+
+    // A leaked lock must not make a generated name suffix either.
+    assert.equal(testApi.uniqueRunningName(ghost, undefined, undefined, sessionId), ghost);
+  });
+
+  it("releases only the step that started, and only its own chain's entry", () => {
+    // Unit half of the step-start release: the same-name entry a DIFFERENT chain
+    // holds must never be handed over, and a sibling step must keep its promise.
+    const mine: any = {
+      name: `rel-${nonce()}`,
+      steps: [
+        { index: 1, agent: "worker", task: "a", name: `mine1-${nonce()}`, status: "pending" },
+        { index: 2, agent: "scout", task: "b", name: `mine2-${nonce()}`, status: "pending" },
+      ],
+      currentStep: 0,
+      currentRunning: null,
+      startTime: Date.now(),
+      finished: false,
+      aborted: false,
+      surfaceLost: false,
+      abortController: new AbortController(),
+    };
+    const sibling: any = {
+      ...mine,
+      name: `rel-sib-${nonce()}`,
+      steps: [{ index: 1, agent: "worker", task: "a", name: mine.steps[0].name, status: "pending" }],
+    };
+    testApi.getChainMapForSession(sessionId).set(mine.name, mine);
+    testApi.getChainMapForSession(sessionId).set(sibling.name, sibling);
+    testApi.lockPendingStepNames(sessionId, mine);
+    // The sibling promises the SAME name as step 1 (validation would have refused
+    // it, but a release must never rely on that): its entry is the one registered.
+    testApi.lockPendingStepNames(sessionId, sibling);
+    assert.equal(lockMapOf(sessionId)?.get(mine.steps[0].name)?.chain, sibling, "the winner holds it");
+
+    testApi.releaseStepNameLocks(mine, 1);
+    assert.ok(
+      lockMapOf(sessionId)?.has(mine.steps[0].name),
+      "releasing a name another chain holds is a no-op",
+    );
+    assert.ok(lockMapOf(sessionId)?.has(mine.steps[1].name), "step 2's lock is untouched");
+
+    testApi.releaseStepNameLocks(mine);
+    assert.ok(!lockMapOf(sessionId)?.has(mine.steps[1].name), "and the whole-chain release cleared it");
+    assert.ok(lockMapOf(sessionId)?.has(mine.steps[0].name), "while the sibling's entry survives");
+
+    testApi.releaseStepNameLocks(sibling);
+    assert.equal(lockMapOf(sessionId)?.size ?? 0, 0, "and nothing is left behind");
+  });
+
+  // ── Up-front step-name validation: a chain call is binary ──
+  //
+  // A chain either starts, or the tool call errors and NOTHING is registered. So
+  // every name the session already owns is checked before anything is written to
+  // the chain map, the registry or `reservedNames`; the three tests below differ
+  // only in WHICH holder owns the step's explicit name. Names are nonce-prefixed
+  // because `runningSubagents` and `reservedNames` are process-global and other
+  // suites fill them with plain ones.
+
+  const artifactDirOf = () => join(sessionDir, "artifacts", sessionId);
+
+  /**
+   * Assert a chain call was refused outright: nothing launched, nothing
+   * registered, nothing reserved, and the error names the step, the name and what
+   * to do about it. `registryBefore` is the registry snapshot taken beforehand.
+   */
+  function assertRefusedUpFront(
+    result: any,
+    opts: { chainName: string; stepName: string; stepIndex: number; registryBefore: string; reservedBefore: string[] },
+  ) {
+    assert.equal(
+      result.content[0].text,
+      `Sub-agent chain step name "${opts.stepName}" is already in use. Choose a different name.`,
+      "the terse collision sentence: kind of name, the name, in use",
+    );
+    assert.equal(result.details?.error, result.content[0].text, "details.error is the same sentence");
+    assert.ok(result.details?.kind, "and details carries the KIND of holder the text no longer names");
+    assert.equal(result.details?.step, opts.stepIndex, "renderers get the step index too");
+    assert.equal(result.details?.chainName, undefined, "no chain handle was handed out");
+    assert.equal(testApi.getChainMapForSession(sessionId).has(opts.chainName), false, "the chain map has no new key");
+    assert.equal(testApi.getChainMapForSession(sessionId).size, 0, "and holds nothing else either");
+    assert.deepEqual(
+      Array.from(testApi.reservedNames).sort(),
+      [...opts.reservedBefore].sort(),
+      "the rejection reserved nothing of its own",
+    );
+    assert.equal(JSON.stringify(readNameRegistry(artifactDirOf())), opts.registryBefore, "the registry is unchanged");
+    assert.equal(launchGuard.calls.length, 0, "no pane and no process at any point");
+  }
+
+  it("refuses a chain whose step name a running sub-agent holds", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const nonce = `ufA${Math.random().toString(36).slice(2, 8)}`;
+    const chainName = `${nonce}-chain`;
+    const held = `${nonce}-row`;
+    const row = makeFakeRunning(held);
+    testApi.runningSubagents.set(row.id, row);
+    const registryBefore = JSON.stringify(readNameRegistry(artifactDirOf()));
+    const reservedBefore = Array.from(testApi.reservedNames);
+    const launches: string[] = [];
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any) => {
+      launches.push(step.name);
+      return { name: step.name, summary: "S", exitCode: 0, elapsed: 1 };
+    };
+    try {
+      const clash = await subagentTool.execute(
+        "call-1",
+        {
+          name: chainName,
+          chain: [{ agent: "scout", task: "a" }, { agent: "scout", task: "b", name: held }],
+        },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(clash.details?.kind, "running", "details says who holds it");
+      assert.equal(clash.details?.holder, row.id, "and points at that row");
+      assertRefusedUpFront(clash, { chainName, stepName: held, stepIndex: 2, registryBefore, reservedBefore });
+      assert.deepEqual(launches, [], "and no step of the chain ran");
+    } finally {
+      testApi.runningSubagents.delete(row.id);
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("refuses a chain whose step name this session's registry holds", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const nonce = `ufB${Math.random().toString(36).slice(2, 8)}`;
+    const chainName = `${nonce}-chain`;
+    const held = `${nonce}-done`;
+    // A FINISHED sub-agent: nothing is running, but the name still addresses it.
+    registerName(artifactDirOf(), held, { sessionFile: join(sessionDir, "gone.jsonl"), sessionId: null });
+    const registryBefore = JSON.stringify(readNameRegistry(artifactDirOf()));
+    const reservedBefore = Array.from(testApi.reservedNames);
+    const launches: string[] = [];
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any) => {
+      launches.push(step.name);
+      return { name: step.name, summary: "S", exitCode: 0, elapsed: 1 };
+    };
+    try {
+      const clash = await subagentTool.execute(
+        "call-1",
+        {
+          name: chainName,
+          chain: [{ agent: "scout", task: "a" }, { agent: "scout", task: "b", name: held }],
+        },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(clash.details?.kind, "registry", "details says who holds it");
+      assertRefusedUpFront(clash, { chainName, stepName: held, stepIndex: 2, registryBefore, reservedBefore });
+      assert.deepEqual(launches, [], "and no step of the chain ran");
+    } finally {
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("refuses a chain whose step name a parallel spawn is reserving", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const nonce = `ufC${Math.random().toString(36).slice(2, 8)}`;
+    const chainName = `${nonce}-chain`;
+    const held = `${nonce}-mid`;
+    // A spawn that is mid-launch: it has claimed the name but not registered yet,
+    // so nothing else in the process knows about it.
+    testApi.reservedNames.add(held);
+    const registryBefore = JSON.stringify(readNameRegistry(artifactDirOf()));
+    const reservedBefore = Array.from(testApi.reservedNames);
+    const launches: string[] = [];
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any) => {
+      launches.push(step.name);
+      return { name: step.name, summary: "S", exitCode: 0, elapsed: 1 };
+    };
+    try {
+      const clash = await subagentTool.execute(
+        "call-1",
+        {
+          name: chainName,
+          chain: [{ agent: "scout", task: "a" }, { agent: "scout", task: "b", name: held }],
+        },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(clash.details?.kind, "reserved", "details says who holds it");
+      assertRefusedUpFront(clash, { chainName, stepName: held, stepIndex: 2, registryBefore, reservedBefore });
+      assert.ok(testApi.reservedNames.has(held), "the other spawn's reservation survives");
+      assert.deepEqual(launches, [], "and no step of the chain ran");
+    } finally {
+      testApi.reservedNames.delete(held);
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("starts a chain whose later steps carry free explicit names", async () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const subagentTool = registeredTools.find((tool) => tool.name === "subagent");
+
+    const nonce = `ufD${Math.random().toString(36).slice(2, 8)}`;
+    const chainName = `${nonce}-chain`;
+    const second = `${nonce}-b`;
+    const third = `${nonce}-c`;
+    const launches: string[] = [];
+    const original = testApi.chainHooks.runStep;
+    testApi.chainHooks.runStep = async (step: any) => {
+      launches.push(step.name);
+      return { name: step.name, summary: "S", exitCode: 0, elapsed: 1 };
+    };
+    try {
+      // The other half of the policy: validating up front must not turn into
+      // rejecting chains that are actually fine. Only step 1 has no explicit name.
+      const ack = await subagentTool.execute(
+        "call-1",
+        {
+          name: chainName,
+          chain: [
+            { agent: "scout", task: "a" },
+            { agent: "worker", task: "b", name: second },
+            { agent: "scout", task: "c", name: third },
+          ],
+        },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(ack.details?.error, undefined, "the chain was accepted");
+      assert.equal(ack.details?.chainName, chainName);
+      const chain = testApi.getChainMapForSession(sessionId).get(chainName);
+      assert.ok(chain, "and registered");
+      for (let i = 0; i < 100 && chain && !chain.finished; i++) await chainSleep(10);
+
+      assert.ok(chain?.finished, "the chain ran to the end");
+      assert.deepEqual(
+        chain?.steps.map((s: any) => s.status),
+        ["completed", "completed", "completed"],
+        "every step ran",
+      );
+      assert.deepEqual(launches, ["scout", second, third], "each with the name it was given");
+      assert.equal(launchGuard.calls.length, 0, "no pane and no process at any point");
+    } finally {
+      const chain = testApi.getChainMapForSession(sessionId).get(chainName);
+      if (chain && !chain.finished) {
+        chain.aborted = true;
+        chain.abortController.abort();
+      }
+      testApi.chainHooks.runStep = original;
+    }
+  });
+});
+
+// ── Per-launch artifacts, explicit names, and ambiguous names ──
+//
+// The reproduced incident: two parallel `subagent({ agent: "worker", name: "test" })`
+// calls. Both name paths were `name-<second>-precision`, so launch #2 wrote its
+// brief over launch #1's before #1 read it — same task, same answer, twice. And
+// because an explicit `name` was never checked against anything, both launches
+// also claimed the same handle (the second overwriting the first in the registry).
+describe("subagent name and artifact uniqueness", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  const saved = {
+    agent: process.env.PI_SUBAGENT_AGENT,
+    allowed: process.env.PI_SUBAGENT_ALLOWED,
+  };
+  let sessionDir: string;
+  let sessionId: string;
+  let reservedBefore: string[];
+
+  beforeEach(() => {
+    sessionDir = createTestDir();
+    sessionId = `uniq-${Math.random().toString(36).slice(2)}`;
+    delete process.env.PI_SUBAGENT_AGENT;
+    delete process.env.PI_SUBAGENT_ALLOWED;
+    reservedBefore = Array.from(testApi.reservedNames);
+    // Shared process-global state: a row or a chain left over from another suite
+    // would make these name checks pass or fail on ordering instead of on the fix.
+    testApi.runningSubagents.clear();
+    clearChainsForTest();
+  });
+
+  afterEach(() => {
+    restoreEnvVar("PI_SUBAGENT_AGENT", saved.agent);
+    restoreEnvVar("PI_SUBAGENT_ALLOWED", saved.allowed);
+    testApi.stopTimersForTest();
+    clearChainsForTest();
+    testApi.runningSubagents.clear();
+    for (const name of Array.from(testApi.reservedNames)) {
+      if (!reservedBefore.includes(name)) testApi.reservedNames.delete(name);
+    }
+    try {
+      rmSync(sessionDir, { recursive: true, force: true });
+    } catch {}
+  });
+
+  function mockCtx() {
+    return {
+      sessionManager: {
+        getSessionFile: () => join(sessionDir, "session.jsonl"),
+        getSessionId: () => sessionId,
+        getSessionDir: () => sessionDir,
+      },
+      cwd: sessionDir,
+    } as any;
+  }
+
+  const artifactDir = () => join(sessionDir, "artifacts", sessionId);
+
+  /** A row in `runningSubagents`, as a real launch would leave it. */
+  function makeFakeRunning(name: string) {
+    const fake: any = {
+      id: `fake-${Math.random().toString(36).slice(2)}`,
+      name,
+      surface: "%stub",
+      startTime: Date.now(),
+      sessionFile: join(sessionDir, `sub-${name}-${Math.random().toString(36).slice(2)}.jsonl`),
+      interactive: false,
+    };
+    fake.statusState = createStatusState({ source: "pi", startTimeMs: fake.startTime });
+    return fake;
+  }
+
+  /** The prompt-file path out of an applySandboxToParts() parts array. */
+  function promptFileOf(parts: string[], flag: string): string {
+    const i = parts.indexOf(flag);
+    assert.ok(i >= 0, `expected ${flag} in ${parts.join(" ")}`);
+    return parts[i + 1].replace(/^'/, "").replace(/'$/, "").replace(/'\\''/g, "'");
+  }
+
+  /**
+   * Replace the launch/watch seams so a spawn needs no tmux: `launch` registers
+   * the row it returns (like the real launch does) and `watch` finishes at once.
+   * Both count calls, and `launch` can be told to hand back a row under a
+   * DIFFERENT name to model what a suffixed spawn would have done.
+   */
+  function stubOps() {
+    const origLaunch = testApi.subagentOps.launch;
+    const origWatch = testApi.subagentOps.watch;
+    const launched: any[] = [];
+    testApi.subagentOps.launch = async (params: any) => {
+      launched.push(params);
+      const fake = makeFakeRunning(params.name);
+      testApi.runningSubagents.set(fake.id, fake);
+      return fake;
+    };
+    testApi.subagentOps.watch = async (running: any) => ({
+      name: running.name,
+      task: running.task,
+      summary: "done",
+      exitCode: 0,
+      elapsed: 1,
+      sessionFile: running.sessionFile,
+    });
+    return {
+      launched,
+      restore: () => {
+        testApi.subagentOps.launch = origLaunch;
+        testApi.subagentOps.watch = origWatch;
+      },
+    };
+  }
+
+  /** A tool pair from the loaded extension. */
+  function tools() {
+    const mock = createMockExtensionApi();
+    (subagentsModule as any).default(mock.api);
+    return {
+      subagent: mock.registeredTools.find((t: any) => t.name === "subagent"),
+      message: mock.registeredTools.find((t: any) => t.name === "subagent_message"),
+      sent: mock.sentMessages,
+    };
+  }
+
+  // ── DEFECT 1: artifact filenames must be unique per LAUNCH ──
+
+  it("names every hand-off artifact with the launch id", () => {
+    const dir = "/tmp/x";
+    const stamp = String.raw`\d{4}-\d{2}-\d{2}T\d{2}-\d{2}-\d{2}`;
+    const brief = testApi.launchArtifactPath(dir, { dir: "context", name: "test", id: "aaa111" });
+    const other = testApi.launchArtifactPath(dir, { dir: "context", name: "test", id: "bbb222" });
+    assert.match(brief, new RegExp(String.raw`^/tmp/x/context/test-${stamp}-aaa111\.md$`));
+    assert.notEqual(brief, other, "same name, same second, different launch → different path");
+
+    const prompt = testApi.launchArtifactPath(dir, {
+      dir: "context",
+      name: "test",
+      kind: "sysprompt",
+      id: "aaa111",
+    });
+    assert.match(prompt, new RegExp(String.raw`^/tmp/x/context/test-sysprompt-${stamp}-aaa111\.md$`));
+
+    const resumed = testApi.launchArtifactPath(dir, {
+      dir: "subagent-resume",
+      name: "test",
+      id: "ccc333",
+      fallback: "resume",
+    });
+    assert.match(resumed, new RegExp(String.raw`^/tmp/x/subagent-resume/test-${stamp}-ccc333\.md$`));
+    // A name with nothing filename-safe in it still lands on a readable path.
+    assert.match(
+      testApi.launchArtifactPath(dir, { dir: "context", name: "☃", id: "ddd444", fallback: "resume" }),
+      new RegExp(String.raw`^/tmp/x/context/resume-${stamp}-ddd444\.md$`),
+    );
+  });
+
+  it("never overwrites an existing artifact, and reports the path it wrote", () => {
+    withTempDir((dir) => {
+      const path = join(dir, "context", "test-2026-10-06T13-57-44-aaa111.md");
+      assert.equal(testApi.writeArtifactExclusive(path, "FIRST"), path);
+      const second = testApi.writeArtifactExclusive(path, "SECOND");
+      assert.notEqual(second, path, "a collision degrades to a numbered path, never an overwrite");
+      assert.equal(readFileSync(path, "utf8"), "FIRST", "the first brief survives");
+      assert.equal(readFileSync(second, "utf8"), "SECOND");
+    });
+  });
+
+  it("routes the sysprompt artifact through the per-launch path", () => {
+    withTempDir((dir) => {
+      const loadout: SubagentLoadout = {
+        agent: "worker",
+        toolAllowlist: null,
+        model: null,
+        thinking: null,
+        systemPromptMode: "append",
+        identity: "You are the worker.",
+        spawnable: null,
+        autoExit: true,
+        cwd: null,
+        agentDir: null,
+        modelOverrides: null,
+      };
+      const a: string[] = [];
+      const b: string[] = [];
+      testApi.applySandboxToParts(a, loadout, { artifactDir: dir, name: "test", id: "aaa111" });
+      testApi.applySandboxToParts(b, loadout, { artifactDir: dir, name: "test", id: "bbb222" });
+      const fileOf = (parts: string[]) => promptFileOf(parts, "--append-system-prompt");
+      const pathA = fileOf(a);
+      const pathB = fileOf(b);
+      assert.notEqual(pathA, pathB, "two launches of one name get their own prompt file");
+      assert.match(pathA, /\/context\/test-sysprompt-\d{4}-.*-aaa111\.md$/);
+      assert.ok(existsSync(pathA) && existsSync(pathB));
+    });
+  });
+
+  // ── DEFECT 2: an explicit name must be unique or the call is rejected ──
+
+  it("rejects an explicit name a running sub-agent already holds", async () => {
+    const { subagent } = tools();
+    const row = makeFakeRunning("test");
+    testApi.runningSubagents.set(row.id, row);
+    const ops = stubOps();
+    try {
+      const result = await subagent.execute(
+        "call-1",
+        { agent: "worker", name: "test", task: "do it" },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(
+        result.content[0].text,
+        'Sub-agent name "test" is already in use. Choose a different name.',
+      );
+      assert.equal(result.details?.kind, "running", "the holder lives in details");
+      assert.equal(result.details?.holder, row.id, "and it is the running row");
+      assert.equal(ops.launched.length, 0, "a rejected spawn launches nothing");
+      assert.equal(testApi.runningSubagents.get(row.id)?.name, "test", "the running sub-agent keeps its name");
+      assert.equal(testApi.runningSubagents.size, 1);
+      assert.ok(!testApi.reservedNames.has("test-2"), "no silent suffixing of an explicit name");
+    } finally {
+      ops.restore();
+    }
+  });
+
+  it("rejects an explicit name the session registry already answers to", async () => {
+    const { subagent } = tools();
+    registerName(artifactDir(), "test", { sessionFile: join(sessionDir, "gone.jsonl"), sessionId: null });
+    const ops = stubOps();
+    try {
+      const result = await subagent.execute(
+        "call-1",
+        { agent: "worker", name: "test", task: "do it" },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(
+        result.content[0].text,
+        'Sub-agent name "test" is already in use. Choose a different name.',
+      );
+      assert.equal(
+        result.details?.kind,
+        "registry",
+        "the sentence no longer explains that the name resolves to a FINISHED sub-agent — details does",
+      );
+      assert.equal(ops.launched.length, 0);
+    } finally {
+      ops.restore();
+    }
+  });
+
+  it("rejects the second of two parallel spawns that name themselves the same", async () => {
+    const { subagent } = tools();
+    const ops = stubOps();
+    try {
+      // Both tool calls are dispatched before either settles — the exact shape
+      // of the incident. The name check + reservation is synchronous, so the
+      // second call must see the first one's reservation.
+      const [first, second] = await Promise.all([
+        subagent.execute("call-1", { agent: "worker", name: "test", task: "TASK ONE" }, undefined, undefined, mockCtx()),
+        subagent.execute("call-2", { agent: "worker", name: "test", task: "TASK TWO" }, undefined, undefined, mockCtx()),
+      ]);
+
+      assert.equal(first.details?.error, undefined, "the first spawn goes through");
+      assert.equal(
+        second.content[0].text,
+        'Sub-agent name "test" is already in use. Choose a different name.',
+      );
+      assert.ok(
+        second.details?.kind === "reserved" || second.details?.kind === "running",
+        "details names the holder: the winner's reservation, or its row if it registered first",
+      );
+
+      assert.equal(ops.launched.length, 1, "exactly one launch happened");
+      assert.equal(ops.launched[0].name, "test", "the winner kept the name it was given — no suffix");
+      assert.equal(ops.launched[0].task, "TASK ONE", "and it got its own task");
+      const rows = Array.from(testApi.runningSubagents.values());
+      assert.equal(rows.length, 1, "one sub-agent is running");
+      assert.equal(rows[0].name, "test");
+      assert.equal(
+        resolveNameInRegistry(artifactDir(), "test")?.sessionFile,
+        rows[0].sessionFile,
+        "the registry still maps the name to the FIRST sub-agent",
+      );
+      assert.ok(!testApi.reservedNames.has("test"), "the reservation is released once it registers");
+    } finally {
+      ops.restore();
+    }
+  });
+
+  it("still auto-suffixes DEFAULTED names for parallel spawns", async () => {
+    const { subagent } = tools();
+    const ops = stubOps();
+    try {
+      const [first, second] = await Promise.all([
+        subagent.execute("call-1", { agent: "worker", task: "A" }, undefined, undefined, mockCtx()),
+        subagent.execute("call-2", { agent: "worker", task: "B" }, undefined, undefined, mockCtx()),
+      ]);
+      assert.equal(first.details?.error, undefined);
+      assert.equal(second.details?.error, undefined, "a defaulted name never collides, so it never rejects");
+      assert.deepEqual(
+        ops.launched.map((p: any) => p.name),
+        ["worker", "worker-2"],
+        "the defaulted path keeps suffixing exactly as before",
+      );
+    } finally {
+      ops.restore();
+    }
+  });
+
+  it("fails a chain step whose name is taken only after the chain started, and stops the chain", async () => {
+    const { subagent, sent } = tools();
+    // Tripwire first, before anything can reach it: this test drives a chain, and
+    // a chain step must never touch a real pane even though tmux is available.
+    const tripwire = forbidRealLaunches();
+    const original = testApi.chainHooks.runStep;
+    const calls: any[] = [];
+    let releaseStep: (() => void) | undefined;
+    const gate = new Promise<void>((r) => (releaseStep = r));
+    const nonce = `late${Math.random().toString(36).slice(2, 8)}`;
+    const chainName = `${nonce}-chain`;
+    // Step 2's intended explicit name — free for the whole up-front check.
+    const takenLate = `${nonce}-late`;
+    testApi.chainHooks.runStep = async (step: any, _ctx: any, parentArtifactDir: any, _pi: any, signal: AbortSignal) => {
+      calls.push(step);
+      if (calls.length === 1) {
+        // Hold step 1 so the name can be taken while the chain is in flight.
+        await Promise.race([
+          gate,
+          new Promise<void>((r) => signal.addEventListener("abort", () => r(), { once: true })),
+        ]);
+      }
+      registerName(parentArtifactDir, step.name, {
+        sessionFile: join(sessionDir, `sub-${step.name}.jsonl`),
+        sessionId: null,
+      });
+      return { name: step.name, summary: "S", exitCode: 0, elapsed: 1 };
+    };
+    try {
+      const ack = await subagent.execute(
+        "call-1",
+        {
+          name: chainName,
+          chain: [
+            { agent: "scout", task: "a" },
+            { agent: "scout", task: "b", name: takenLate },
+          ],
+        },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.equal(ack.details?.status, "chain-started", "the name was free at the tool call, so the chain ran");
+      const chain = testApi.getChainMapForSession(sessionId).get(chainName);
+      for (let i = 0; i < 50 && chain && chain.currentStep === 0; i++) await chainSleep(10);
+      assert.equal(chain?.currentStep, 1, "step 1 is running");
+
+      // The one late failure up-front validation cannot prevent: the name became
+      // someone else's while the chain was in flight. The step-start check is the
+      // backstop for exactly this, and it must say what to do about it.
+      const late = makeFakeRunning(takenLate);
+      testApi.runningSubagents.set(late.id, late);
+      releaseStep?.();
+      for (let i = 0; i < 100 && !chain?.finished; i++) await chainSleep(10);
+
+      assert.ok(chain?.finished, "the chain finished");
+      assert.equal(calls.length, 1, "step 1 launched; step 2 was never even handed to the runner");
+      assert.ok(!calls.some((c: any) => c.name === takenLate), "the taken name was never claimed");
+      assert.equal(chain.steps[0].status, "completed", "the step that ran is unaffected");
+      assert.equal(chain.steps[1].status, "failed");
+      assert.equal(chain.steps[1].name, takenLate, "the step kept the name its caller chose");
+      assert.equal(
+        String(chain.steps[1].errorMessage),
+        `Sub-agent chain step name "${takenLate}" is already in use. Choose a different name.`,
+        "the collision, worded exactly as the tool call would word it",
+      );
+      // "…this name was free when the chain was accepted…" is gone from the text:
+      // which step failed, and that it failed before launching, are on the step.
+      assert.ok(!chain.steps[1].output, "the step produced nothing");
+      const steer = sent.find((m: any) => m.message?.content?.includes?.(takenLate));
+      assert.ok(steer, "the aggregate steer reports the failure");
+      assert.equal(tripwire.calls.length, 0, "no pane and no process at any point");
+    } finally {
+      releaseStep?.();
+      const chain = testApi.getChainMapForSession(sessionId).get(chainName);
+      if (chain && !chain.finished) {
+        chain.aborted = true;
+        chain.abortController.abort();
+      }
+      for (const row of Array.from(testApi.runningSubagents.values())) {
+        if (row.name === takenLate) testApi.runningSubagents.delete(row.id);
+      }
+      tripwire.restore();
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  // ── DEFECT 2b: two rows sharing a name must not be steered silently ──
+
+  it("answers an ambiguous name with the ambiguity error, not a chain note", async () => {
+    const { message } = tools();
+    const chains = testApi.getChainMapForSession(sessionId);
+    const a = makeFakeRunning("dup");
+    const b = makeFakeRunning("dup");
+    testApi.runningSubagents.set(a.id, a);
+    testApi.runningSubagents.set(b.id, b);
+    const chain: any = {
+      name: "dup",
+      steps: [{ index: 1, agent: "worker", task: "t", name: "dup-step", status: "running" }],
+      currentStep: 1,
+      currentRunning: a,
+      finished: false,
+      aborted: false,
+      abortController: new AbortController(),
+      startTime: Date.now(),
+    };
+    chains.set("dup", chain);
+    try {
+      const result = await message.execute(
+        "call-1",
+        { name: "dup", message: "hurry up" },
+        undefined,
+        undefined,
+        mockCtx(),
+      );
+      assert.match(String(result.details?.error), /^Ambiguous subagent name "dup"\. Matches: dup \[/);
+      assert.match(result.content[0].text, /Matches: dup \[[^\]]+\], dup \[[^\]]+\]/);
+      assert.equal(result.details?.chainShadowed, undefined, "an ambiguous name is never answered as a chain");
+    } finally {
+      chains.delete("dup");
     }
   });
 });
@@ -4102,6 +6864,7 @@ describe("subagent spawn guards", () => {
     restoreEnvVar("PI_SUBAGENT_AGENT", saved.agent);
     restoreEnvVar("PI_SUBAGENT_ALLOWED", saved.allowed);
     testApi.stopTimersForTest();
+    clearChainsForTest();
     try {
       rmSync(sessionDir, { recursive: true, force: true });
     } catch {}
@@ -4143,12 +6906,12 @@ describe("subagent spawn guards", () => {
   }
 
   /**
-   * Stub the launch path so a rejection can be proven to launch nothing. NOTE:
-   * this seam only covers the CHAIN path (chainHooks.runStep -> subagentOps.launch,
-   * index.ts:997). The single-spawn path calls launchSubagent() directly
-   * (index.ts:2742), so for single-spawn tests this counter is only a
-   * belt-and-braces check — those tests must instead rely on mockCtxNoSession()
-   * to stop before any pane is opened.
+   * Stub the launch path so a rejection can be proven to launch nothing. Both
+   * spawn paths go through this seam now — the chain path via
+   * chainHooks.runStep -> subagentOps.launch, and the single-spawn path via
+   * subagentOps.launch/watch directly — so a stubbed launch is a real guard for
+   * either, not just a belt-and-braces counter. Tests that must stop even
+   * earlier (before the name checks) use mockCtxNoSession().
    */
   function stubLaunch(api: any = testApi) {
     const origLaunch = api.subagentOps.launch;

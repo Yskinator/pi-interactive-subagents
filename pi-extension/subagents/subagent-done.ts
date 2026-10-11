@@ -55,12 +55,17 @@ export function shouldMarkUserTookOver(agentStarted: boolean): boolean {
  *
  * Returns 0 when the spawning tools aren't loaded (scout/researcher, or a
  * standalone session), so those agents auto-exit exactly as before.
+ *
+ * Pass the session's own id when you have one: the shared map is process-global
+ * and pi can host several sessions in one process, so an unscoped count would let
+ * ANOTHER session's children park this one here forever. An older `index.ts` that
+ * ignores the argument just reports the whole map, as before.
  */
-export function runningChildrenCount(): number {
+export function runningChildrenCount(sessionId?: string | null): number {
   const fn = (globalThis as any)[Symbol.for("pi-subagents/running-children-count")];
   if (typeof fn !== "function") return 0;
   try {
-    const n = fn();
+    const n = fn(sessionId ?? undefined);
     return typeof n === "number" && n > 0 ? n : 0;
   } catch {
     return 0;
@@ -249,12 +254,13 @@ export default function (pi: ExtensionAPI) {
     const messages = (event as any).messages as any[] | undefined;
     // Never shut down while this session still has work in flight:
     //  - awaitingAnswer: an ask_question is pending the orchestrator's reply.
-    //  - runningChildrenCount(): this subagent spawned its own children and is
+    //  - runningChildrenCount(id): this subagent spawned its own children and is
     //    waiting for their results (delivered as steered turns). Exiting now
     //    would strand those children and drop their results.
     // In both cases the session parks as `waiting` and resumes when the next
-    // turn lands.
-    const hasPendingChildren = runningChildrenCount() > 0;
+    // turn lands. The id scopes the count to THIS session — one process can host
+    // several, and a stranger's children must not park this one forever.
+    const hasPendingChildren = runningChildrenCount(ctx?.sessionManager?.getSessionId?.()) > 0;
     const shouldExit =
       !awaitingAnswer &&
       !hasPendingChildren &&
