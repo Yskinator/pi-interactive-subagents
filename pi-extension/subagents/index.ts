@@ -226,6 +226,7 @@ interface ListedAgentDefinition extends AgentDefinition {
 const SPAWNING_TOOLS = [
   "subagent",
   "subagent_message",
+  "subagent_stop",
   "subagents_list",
 ] as const;
 
@@ -1224,6 +1225,23 @@ interface ActiveChain {
   finishedAt?: number;
   /** True when aborted because the parent session shut down. */
   aborted: boolean;
+  /**
+   * True when the orchestrator asked for this chain to be stopped
+   * (`subagent_stop`). Deliberately distinct from `aborted`: nothing is torn
+   * down here. The current step stays alive and is asked to wrap up; the flag
+   * only tells the driver not to start another step. Set before anything else
+   * happens, so the driver can never race ahead of the cancellation.
+   */
+  cancelled: boolean;
+  /**
+   * True once the STOP request has actually REACHED a running step (typed into
+   * its pane or returned as an `ask_question` reply). Only set by
+   * `cancelChainGracefully`, and only when the delivery succeeded — it is what
+   * lets a second `subagent_stop` say "already told to stop" truthfully. When a
+   * first call's pane write failed the flag stays unset, so the next call
+   * retries the steer instead of claiming the child was already informed.
+   */
+  stopSteerDelivered?: boolean;
   /** True when a step's pane was closed from outside. */
   surfaceLost: boolean;
   abortController: AbortController;
@@ -1408,16 +1426,33 @@ function formatChainPresentation(chain: ActiveChain): string {
   const failedStep = chain.steps.find((s) => s.status === "failed");
 
   let head: string;
+  const failureReason = (step: ChainStepRecord): string =>
+    chain.surfaceLost
+      ? "the step's pane was closed"
+      : step.errorMessage
+        ? `provider/agent error: ${step.errorMessage}`
+        : `exit code ${step.exitCode ?? "?"}`;
   if (chain.aborted) {
     head = `Chain "${chain.name}" was cancelled (parent session shut down). ${completed}/${total} steps completed.`;
-  } else if (failedStep) {
-    const reason = chain.surfaceLost
-      ? "the step's pane was closed"
-      : failedStep.errorMessage
-        ? `provider/agent error: ${failedStep.errorMessage}`
-        : `exit code ${failedStep.exitCode ?? "?"}`;
+  } else if (chain.cancelled) {
+    // An explicit stop, not a teardown — saying "parent session shut down" here
+    // would be flatly wrong, and the chain may well have a completed last step
+    // (a step that obeys the stop request exits cleanly).
     head =
-      `Chain "${chain.name}" stopped at step ${failedStep.index}/${total} (${failedStep.agent}) — ${reason}. ` +
+      `Chain "${chain.name}" was cancelled (stop requested). ` +
+      `${completed}/${total} steps completed; remaining steps were not run.`;
+    if (failedStep) {
+      // A stop is not what broke this step — the child ignored the STOP, lost
+      // its pane, or hit a provider error — and the chain ends on THAT step. The
+      // aborted/failedStep heads both name the reason; dropping it here would
+      // leave it recoverable only from the step section below.
+      head +=
+        ` Step ${failedStep.index}/${total} (${failedStep.agent}) did not stop for the cancel — ` +
+        `${failureReason(failedStep)}.`;
+    }
+  } else if (failedStep) {
+    head =
+      `Chain "${chain.name}" stopped at step ${failedStep.index}/${total} (${failedStep.agent}) — ${failureReason(failedStep)}. ` +
       `${completed}/${total} steps completed in ${formatElapsed(totalSeconds)}; remaining steps were not run.`;
   } else {
     head = `Chain "${chain.name}" completed: ${completed}/${total} steps in ${formatElapsed(totalSeconds)}.`;
@@ -1583,7 +1618,9 @@ async function runChain(
   const sequence = chain.steps.map((s) => s.agent).join(" → ");
 
   for (const step of chain.steps) {
-    if (chain.aborted || chain.abortController.signal.aborted) {
+    if (chain.aborted || chain.cancelled || chain.abortController.signal.aborted) {
+      // A cancelled chain (stop requested) reaches the release below exactly like a
+      // failed one does, so the skipped steps' locks are freed at the chain end.
       // An aborted chain never reaches the release below, so a step skipped here
       // keeps its reservation until the loop ends — which every abort does, since
       // this branch runs for the rest of the steps and then falls through to the
@@ -1718,7 +1755,12 @@ async function runChain(
       if (reservedStepName) reservedNames.delete(reservedStepName, stepSessionId);
     }
 
-    if (step.status !== "completed") {
+    if (step.status !== "completed" || chain.cancelled) {
+      // `chain.cancelled` matters even for a COMPLETED step: a step that obeys a
+      // stop request exits cleanly, which counts as success, and without this the
+      // chain would simply start step N+1. For a chain nobody cancelled the
+      // condition is exactly what it always was.
+      //
       // The chain stopped: mark the remaining steps so the presentation and
       // the renderer can show exactly what never ran.
       for (const rest of chain.steps.slice(chain.steps.indexOf(step) + 1)) {
@@ -1750,7 +1792,11 @@ async function runChain(
           chain: true,
           exitCode: allCompleted ? 0 : 1,
           elapsed: Math.max(0, Math.floor((chain.finishedAt - chain.startTime) / 1000)),
-          ...(chain.aborted ? { cancelled: true } : {}),
+          ...(chain.aborted || chain.cancelled ? { cancelled: true } : {}),
+          // Tells the renderer (and any consumer of `details`) WHICH teardown this
+          // is: the shutdown path has set `cancelled` all along, so the tag needs
+          // a second flag to keep "stop requested" and "session shut down" apart.
+          ...(chain.cancelled && !chain.aborted ? { stopRequested: true } : {}),
           ...(chain.surfaceLost ? { surfaceLost: true } : {}),
           steps: chainStepDetails(chain.steps),
         },
@@ -1972,6 +2018,7 @@ function startChain(
     startTime: Date.now(),
     finished: false,
     aborted: false,
+    cancelled: false,
     surfaceLost: false,
     abortController: new AbortController(),
   };
@@ -2049,7 +2096,8 @@ function startChain(
           `(no {previous} placeholder needed). Do NOT poll, sleep, or try to track it manually. ` +
           `The aggregate result for the whole chain arrives as a steer message when the last step finishes, ` +
           `or when the chain stops early because a step failed. ` +
-          `To reach the currently running step: subagent_message({ name: "${chain.name}", message: "…" }) or the step's own name.`,
+          `To reach the currently running step: subagent_message({ name: "${chain.name}", message: "…" }) or the step's own name. ` +
+          `To cancel the chain (gracefully — no later step runs): subagent_stop({ name: "${chain.name}" }).`,
       },
     ],
     details: {
@@ -3020,6 +3068,320 @@ function handleSubagentSteer(
   };
 }
 
+// ── Graceful chain cancellation (`subagent_stop`) ─────────────────────────
+// Cancelling a chain is a REQUEST, not a kill: the flag tells the driver not to
+// start another step, and the steer asks whichever step is running to wrap up.
+// Nothing here aborts a step's watcher, closes its pane, or types C-c — a child
+// mid-tool-call keeps running until it exits on its own, which is why the chain
+// (and the names its steps hold) stays alive until then. The one teardown that
+// still ends a chain immediately is closing its pane, which the existing
+// `surfaceLost` path turns into a failed step and an early chain end.
+
+/**
+ * The stop request typed into a chain step that is still running.
+ *
+ * A step parked in `ask_question` receives it as the REPLY to its pending
+ * question, so the text has to disown that reading explicitly: without the
+ * clause, a child would treat the STOP as the orchestrator's answer and carry on
+ * with whatever the answer implied.
+ */
+function chainStopMessage(chain: ActiveChain): string {
+  return (
+    `STOP: the orchestrator has cancelled chain "${chain.name}" ` +
+    `(you are step ${chain.currentStep}/${chain.steps.length}). Stop immediately — do no further work, ` +
+    `start no new tool calls and no new sub-agents, and end this turn right away with a short summary of what you ` +
+    `completed and what you did not. No later step of this chain will run. ` +
+    `If this reached you as the answer to an ask_question call, it is NOT that answer — the chain was cancelled.`
+  );
+}
+
+/**
+ * Cancel one chain and build the `subagent_stop` result for it.
+ *
+ * `chain.cancelled` is set FIRST, before anything can await or fail: the driver
+ * reads it at the top of the loop and after every step, so from that line on no
+ * further step can start — even if the steer to the running step cannot be
+ * delivered. The steer is best-effort on top of that guarantee, not the
+ * guarantee itself.
+ *
+ * A chain a teardown already took down is reported as such instead of being
+ * "cancelled": its driver is unwinding whatever this says, and typing a STOP
+ * into a pane that is being torn down would only look like a delivery.
+ */
+function cancelChainGracefully(
+  chain: ActiveChain,
+  send: (surface: string, command: string) => void = sendCommand,
+) {
+  if (!chain.cancelled && (chain.aborted || chain.abortController.signal.aborted)) {
+    // Nothing was cancelled here, and the chain is not ours to cancel any more.
+    const why = chain.aborted
+      ? "its parent session shut down"
+      : chain.surfaceLost
+        ? "a step's pane was closed"
+        : "it is unwinding an abort already in flight";
+    const err =
+      `Chain "${chain.name}" is already being torn down (${why}) — there is nothing left to cancel, ` +
+      `and nothing was typed into any step. Its aggregate result is arriving as a steer message.`;
+    return { content: [{ type: "text" as const, text: err }], details: { error: err, chainName: chain.name } };
+  }
+
+  const wasCancelled = chain.cancelled;
+  // "Already told to stop" may only be claimed when an earlier call actually
+  // reached the step. A first call that could not write to the pane set the
+  // flag but delivered nothing, and skipping the steer then would leave the
+  // child running with no idea anything happened while the reply said it knew.
+  const alreadyTold = wasCancelled && chain.stopSteerDelivered === true;
+  chain.cancelled = true;
+
+  const total = chain.steps.length;
+  const stepIndex = chain.currentStep;
+  // `currentRunning` is only cleared when the CHAIN ends, so between two steps it
+  // still points at the row of the step that just finished. Only a row that IS the
+  // current step can be asked to stop — typing into the pane of a child that
+  // already exited (or answering its stale `.ask`) would be noise, and claiming a
+  // step was interrupted when none is would be a lie.
+  const currentRecord = stepIndex >= 1 ? chain.steps[stepIndex - 1] : undefined;
+  const running =
+    chain.currentRunning && currentRecord?.status === "running" && chain.currentRunning.name === currentRecord.name
+      ? chain.currentRunning
+      : null;
+  const notRun = chain.steps.filter((s) => s.status === "pending");
+  const notRunList = notRun.map((s) => s.agent).join(", ");
+  const noForce =
+    `There is no force-kill path: the current step stays alive until it actually exits, ` +
+    `and the chain — with the names its steps hold — stays live until then.`;
+  const baseDetails: Record<string, unknown> = {
+    status: "cancelled",
+    chainName: chain.name,
+    stepIndex,
+    stepTotal: total,
+    remainingSteps: notRun.length,
+  };
+  if (notRun.length > 0) baseDetails.skippedSteps = notRun.map((s) => s.agent);
+
+  if (running) {
+    const now = Date.now();
+    observeRunningSubagent(running, now);
+    // A step blocked in `ask_question` receives this as the reply to its pending
+    // question (the sidecar path); any other step gets it typed into its pane.
+    const delivered = alreadyTold
+      ? ({ mode: "none" } as const)
+      : deliverSubagentSteer(running, chainStopMessage(chain), send);
+    if ("error" in delivered) {
+      // The flag is already set, so the chain cannot advance anyway — say that
+      // plainly instead of reporting a plain failure, and undo nothing. The
+      // delivery flag stays unset, so a later call retries the steer.
+      return {
+        content: [{
+          type: "text" as const,
+          text:
+            `${delivered.error}\n\n` +
+            `Chain "${chain.name}" is marked cancelled anyway: step ${stepIndex}/${total} (${running.name}) ` +
+            `keeps running until it exits on its own, and the remaining ${notRun.length} step(s) will not start. ${noForce}`,
+        }],
+        details: { ...baseDetails, error: delivered.error, steered: false },
+      };
+    }
+    if (delivered.mode === "typed") {
+      running.statusState = forceStatusAfterInterrupt(running.statusState, now);
+    }
+    chain.stopSteerDelivered = true;
+    updateWidget();
+    const arrival =
+      delivered.mode === "reply"
+        ? "it is blocked in ask_question, so the cancellation is returned to that call as the answer "
+          + "(the text says outright that it is NOT an answer to the question)"
+        : "it picks this up at its next turn boundary";
+    const told = alreadyTold
+      ? `step ${stepIndex}/${total} (${running.name}) was already told to stop by the earlier call, which is not repeated`
+      : wasCancelled
+        ? `step ${stepIndex}/${total} (${running.name}) is told to stop now — an earlier call set the flag but never reached it`
+        : `step ${stepIndex}/${total} (${running.name}) was told to stop immediately and summarize what it finished and what it did not`;
+    return {
+      content: [{
+        type: "text" as const,
+        text:
+          `Chain "${chain.name}" is being cancelled: ${told} — ${arrival}. ` +
+          `${notRun.length === 0 ? `It was the last step, so nothing else was pending.` : `The remaining ${notRun.length} step(s) will not run: ${notRunList}.`} ` +
+          `${noForce} ` +
+          `The aggregate chain result arrives as a steer message when the current step exits, marked cancelled.`,
+      }],
+      details: { ...baseDetails, interrupted: running.name, steered: delivered.mode === "none" ? false : delivered.mode },
+    };
+  }
+
+  updateWidget();
+  // Nothing to interrupt: either the chain has not started a step yet or it is in
+  // the gap between two of them. The flag alone ends it — with the one caveat no
+  // caller can see from outside, that a step which had already passed the loop-top
+  // guard when the flag was set does run, and is then the last one.
+  return {
+    content: [{
+      type: "text" as const,
+      text:
+        `Chain "${chain.name}" is being cancelled. No step was running, so nothing was interrupted. ` +
+        `${notRun.length === 0 ? "No further step was pending." : `${notRun.length} step(s) will not start: ${notRunList}.`} ` +
+        `If a step had already started it runs to its end and is the last one. ` +
+        `${wasCancelled ? "The chain was already being cancelled. " : ""}${noForce} ` +
+        `The aggregate chain result arrives as a steer message shortly, marked cancelled.`,
+    }],
+    details: { ...baseDetails, steered: false },
+  };
+}
+
+/**
+ * The chain of this session that owns `name` as one of its STEPS' names, running
+ * or not.
+ *
+ * Needed because the running row is not always available to answer for a step:
+ * between two steps no row is live, and a one-step chain never stamps its row
+ * with a chain label at all (`normalizeChain` deliberately reports a single step
+ * as "not a chain"), so resolving by the row would refuse it as a plain spawn.
+ * A step name is a name the chain itself promised (`lockPendingStepNames`), so
+ * treating it as an address of the chain is exactly what the tool documents.
+ * Finished chains are skipped: there is nothing left to cancel under them.
+ */
+function findChainByStepName(
+  sessionChains: Map<string, ActiveChain>,
+  name: string,
+): ActiveChain | null {
+  for (const chain of sessionChains.values()) {
+    if (chain.finished) continue;
+    if (chain.steps.some((s) => s.name && s.name === name)) return chain;
+  }
+  return null;
+}
+
+/**
+ * The note for a `subagent_stop` that named a running PLAIN sub-agent whose name
+ * happens to also be an active chain's handle — the same collision
+ * `subagent_message` reports with `chainShadowNote` (resolution is running →
+ * chain in both tools, so the chain is unreachable under that name). Wording
+ * differs because nothing here was delivered at all: no steer, no cancel.
+ */
+function stopChainShadowNote(chain: ActiveChain): string {
+  const firstStepName = chain.steps.find((s) => s.name)?.name;
+  const where = firstStepName
+    ? `Address that chain by one of its step names instead: subagent_stop({ name: "${firstStepName}" }) cancels it.`
+    : "Its steps are not named yet — its aggregate chain steer will arrive when it ends.";
+  return (
+    `Ambiguous subagent name "${chain.name}" — it is also an active chain `
+    + `(${chain.steps.length} steps). Nothing was cancelled: a name that matches a running `
+    + `sub-agent is never resolved to a chain, and this tool cannot stop a single sub-agent. ${where}`
+  );
+}
+
+/**
+ * Body of the `subagent_stop` tool: gracefully cancel a chain by name.
+ *
+ * Name resolution mirrors `subagent_message` exactly — running subagent first,
+ * then this session's chain handles — so one name means the same thing in both
+ * tools. A running CHAIN STEP resolves to its whole chain (stopping one step of
+ * a sequence while the rest march on would be a surprise); a running single
+ * spawn is refused, because this tool has no way to stop one silently.
+ * A name that matches no live row at all still resolves when it is a chain
+ * handle or a step name of a chain of this session, so the gap between two steps
+ * is reachable through either.
+ */
+function handleSubagentStop(
+  params: { name?: string },
+  send: (surface: string, command: string) => void = sendCommand,
+  sessionId?: string | null,
+) {
+  const requestedName = params.name?.trim();
+  if (!requestedName) {
+    const err = "Provide the chain's `name` to cancel — the chain handle or the name of any of its steps.";
+    return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+  }
+
+  const sessionChains = sessionId ? getChainMapForSession(sessionId) : new Map<string, ActiveChain>();
+
+  // ── A running sub-agent: a chain step, or a single spawn ──
+  const resolution = resolveRunningByName(requestedName, sessionId);
+  if ("error" in resolution && resolution.ambiguous) {
+    return { content: [{ type: "text" as const, text: resolution.error }], details: { error: resolution.error } };
+  }
+  const runningMatch = "running" in resolution ? resolution.running : null;
+  if (runningMatch) {
+    const chainHandle = displayChainName(runningMatch.chainName ?? "");
+    if (!chainHandle) {
+      // No chain label on the row. That is either a plain spawn or a step whose
+      // chain never stamped it (a one-step chain — see `findChainByStepName`), so
+      // ask the chains themselves before calling it a single spawn.
+      const ownerByStep = findChainByStepName(sessionChains, runningMatch.name);
+      if (ownerByStep) return cancelChainGracefully(ownerByStep, send);
+      const err =
+        `Sub-agent "${runningMatch.name}" is a single spawn, not a chain step — there is no chain to cancel, ` +
+        `and this tool cannot stop one running sub-agent on its own. It keeps running. ` +
+        `Ask it to wrap up with subagent_message({ name: "${runningMatch.name}", message: "…" }); ` +
+        `it ends when it finishes or when your session shuts down.`;
+      // Same convention as `subagent_message`: when this running row's name is
+      // ALSO an active chain's handle, the collision must be visible — saying
+      // "there is no chain to cancel" while one is running would be false.
+      const shadow = sessionChains.get(requestedName);
+      if (shadow && !shadow.finished) {
+        const note = stopChainShadowNote(shadow);
+        return {
+          content: [{ type: "text" as const, text: `${err}\n\n${note}` }],
+          details: { error: err, name: runningMatch.name, notAChain: true, chainShadowed: true },
+        };
+      }
+      return {
+        content: [{ type: "text" as const, text: err }],
+        details: { error: err, name: runningMatch.name, notAChain: true },
+      };
+    }
+    const ownerChain = sessionChains.get(chainHandle);
+    if (!ownerChain || ownerChain.finished) {
+      const err =
+        `Sub-agent "${runningMatch.name}" belongs to chain "${chainHandle}", which ` +
+        `${ownerChain ? "has already finished" : "is not running in this session"} — there is nothing left to cancel.`;
+      return { content: [{ type: "text" as const, text: err }], details: { error: err, chainName: chainHandle } };
+    }
+    return cancelChainGracefully(ownerChain, send);
+  }
+
+  // ── A chain handle (also covers the gap between steps, where no step runs) ──
+  let chain = sessionChains.get(requestedName);
+  // ── Or the name of one of a chain's steps, running or not ──
+  // Between two steps (and for a one-step chain, whose row carries no chain
+  // label) no row answers to the step's name, so without this scan a documented
+  // step name would be reported as "no running chain named …" in precisely the
+  // window a cancel matters.
+  if (!chain) chain = findChainByStepName(sessionChains, requestedName) ?? undefined;
+  if (chain) {
+    if (chain.finished) {
+      const stepNames = chain.steps.map((s) => s.name).filter(Boolean).join(", ") || "(none recorded)";
+      const err =
+        `Chain "${requestedName}" has already finished — its aggregate result was delivered as a steer message, ` +
+        `so there is nothing left to cancel. To continue working with one of its sessions, ` +
+        `message a step by name: ${stepNames}.`;
+      return {
+        content: [{ type: "text" as const, text: err }],
+        details: { error: "chain finished", chainName: requestedName },
+      };
+    }
+    return cancelChainGracefully(chain, send);
+  }
+
+  // ── Nothing answers to that name ──
+  const chainNames = [...sessionChains.keys()].filter((n) => !sessionChains.get(n)?.finished);
+  const runningNames = [...runningSubagents.values()]
+    .filter((r) => nameRowVisibleTo(r, sessionId))
+    .map((r) => r.name);
+  const hints: string[] = [];
+  if (chainNames.length) hints.push(`running chains: ${[...new Set(chainNames)].join(", ")}`);
+  if (runningNames.length) hints.push(`running subagents: ${[...new Set(runningNames)].join(", ")}`);
+  const err =
+    `No running chain named "${requestedName}" in this session. ` +
+    (hints.length
+      ? `Currently running — ${hints.join("; ")}.`
+      : "No chains or subagents are running in this session.") +
+    ` Pass the chain's handle (the \`name\` the chain call used) or one of its steps' names — ` +
+    `names are exact, and a name that answers to both a running sub-agent and a chain goes to the sub-agent.`;
+  return { content: [{ type: "text" as const, text: err }], details: { error: err } };
+}
+
 function startStatusRefresh(pi: ExtensionAPI) {
   if (!statusConfig.enabled || statusInterval) return;
 
@@ -3118,6 +3480,9 @@ export const __test__ = {
   steerSubagent,
   handleSubagentSteer,
   deliverSubagentSteer,
+  handleSubagentStop,
+  cancelChainGracefully,
+  chainStopMessage,
   resolveResultPresentation,
   formatResultIdentity,
   resultLabel,
@@ -3903,6 +4268,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
         "The chain runs in the background and the aggregate result for the whole chain is delivered as a steer message " +
         "when the last step finishes, or when the chain stops early because a step failed. " +
         "To reach the currently running step, use subagent_message with the chain name or the step's own name. " +
+        "To cancel a running chain so no further step runs, use subagent_stop with the chain name (graceful only: the running step is asked to wrap up). " +
         "Every completion steer names the run it belongs to — `Sub-agent \"<name>\" (agent: <agent>) completed …`, " +
         "plus `; chain \"<chain>\" step i/N` for a chain step — so you always know which child woke you up.",
       promptSnippet:
@@ -4776,6 +5142,91 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       },
     });
 
+  // ── subagent_stop tool ──
+  pi.registerTool({
+      name: "subagent_stop",
+      label: "Stop Subagent Chain",
+      description:
+        "Gracefully cancel a running sub-agent chain so no further step runs. " +
+        "Addressed by name, exactly like subagent_message: pass the chain's handle (the `name` the chain call used) " +
+        "or the name of any of its steps — running or not — a step name cancels the WHOLE chain, not just that step. " +
+        "A name that answers to both a running sub-agent and an active chain goes to the running sub-agent, " +
+        "so a plain (non-chain) sub-agent is never stopped by this tool: the reply says so and points at subagent_message instead. " +
+        "A chain a teardown already took down (parent session shut down, or its pane closed) is reported as already ending, " +
+        "and nothing is typed into it. " +
+        "Cancellation is GRACEFUL: the running step is steered to stop immediately and summarize what it did and did not finish, " +
+        "and it keeps running until it actually exits — there is no force-kill path, no interrupt and no pane close. " +
+        "Every later step is marked skipped, and the chain's single aggregate result arrives as a steer message when the current step exits, " +
+        "marked cancelled. Between steps the flag alone stops the chain. " +
+        "Do NOT poll for the cancelled chain's result — the harness delivers it.",
+      promptSnippet:
+        "Gracefully cancel a running sub-agent chain by name (chain handle or any step's name — a step name cancels the whole chain). " +
+        "The running step is told to stop and summarize; no later step runs. There is no force-kill path: the chain stays alive until the step exits, " +
+        "and the aggregate result arrives later as a steer message marked cancelled. Single (non-chain) sub-agents are not supported.",
+      parameters: Type.Object({
+        name: Type.String({
+          description:
+            "Name of the chain to cancel: its handle, or the name of any of its steps (running or not). Names are exact and session-scoped.",
+        }),
+      }),
+
+      renderCall(args, theme) {
+        const target = args.name ?? "(unknown)";
+        return new Text(
+          "○ " + theme.fg("toolTitle", theme.bold(target)) + theme.fg("dim", " — stop chain"),
+          0,
+          0,
+        );
+      },
+
+      renderResult(result, _opts, theme) {
+        const details = result.details as any;
+
+        if (details?.status === "cancelled") {
+          const skipped = details.remainingSteps
+            ? theme.fg("dim", ` — ${details.remainingSteps} step(s) will not run`)
+            : theme.fg("dim", " — no further steps pending");
+          // A failed pane write still cancels the chain, but the one-line ack must
+          // not hide that the RUNNING step was never told — same treatment as the
+          // `subagent_message` chain-shadow warning.
+          const warning = details.error
+            ? "\n" +
+              theme.fg(
+                "warning",
+                "! the running step could not be reached — it keeps running until it exits on its own",
+              )
+            : "";
+          return new Text(
+            theme.fg("warning", "◻") +
+              " " +
+              theme.fg("toolTitle", theme.bold(details.chainName ?? "chain")) +
+              theme.fg("dim", " — cancelling") +
+              skipped +
+              warning,
+            0,
+            0,
+          );
+        }
+
+        // Fallback / error
+        const fallbackText = result.content[0] as { text?: string } | undefined;
+        const text = typeof fallbackText?.text === "string" ? fallbackText.text : "";
+        return new Text(theme.fg("dim", text), 0, 0);
+      },
+
+      async execute(_toolCallId, params, _signal, _onUpdate, ctx) {
+        if (!isMuxAvailable()) {
+          return muxUnavailableResult();
+        }
+        // Same session scoping as every other name lookup in this extension: the
+        // chains and running rows a stop may touch are the ones THIS session owns.
+        return handleSubagentStop(
+          { name: params.name },
+          sendCommand,
+          ctx.sessionManager.getSessionId(),
+        );
+      },
+    });
   // /subagent command — spawn a subagent by name
   pi.registerCommand("subagent", {
     description: "Spawn a subagent: /subagent <agent> <task>",
@@ -4840,7 +5291,15 @@ export default function subagentsExtension(pi: ExtensionAPI) {
       const bgFn = failed
         ? (text: string) => theme.bg("toolErrorBg", text)
         : (text: string) => theme.bg("toolSuccessBg", text);
+      // A cancelled chain is a stopped chain, not a broken one: the ✗/error
+      // background already says "it did not finish", and the tag says WHY. The
+      // two teardowns set `cancelled` together, so the aggregate steer also sets
+      // `stopRequested` for an explicit `subagent_stop` and the tag can name the
+      // one that actually happened instead of a wording that fits neither.
       const icon = failed ? theme.fg("error", "✗") : theme.fg("success", "✓");
+      const cancelledTag = details.cancelled
+        ? theme.fg("warning", details.stopRequested ? " cancelled (stop requested)" : " cancelled (session shut down)")
+        : "";
 
       return {
         // pi's Component contract — render() is pure here, so there is no
@@ -4861,7 +5320,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
           const contentLines: string[] = [
             `${icon} ${theme.fg("toolTitle", theme.bold(name))} ` +
               theme.fg("accent", `chain ${completedCount}/${steps.length}`) +
-              ` ${theme.fg("dim", "—")} ${theme.fg("dim", elapsed)}`,
+              ` ${theme.fg("dim", "—")} ${theme.fg("dim", elapsed)}` +
+              cancelledTag,
             ...steps.map((s, i: number) => {
               const sIcon =
                 s.status === "completed"

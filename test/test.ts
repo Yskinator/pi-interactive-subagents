@@ -1,6 +1,6 @@
 import { describe, it, before, after, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, utimesSync, readdirSync } from "node:fs";
+import { mkdtempSync, writeFileSync, readFileSync, mkdirSync, rmSync, existsSync, utimesSync, readdirSync, unlinkSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
@@ -6389,6 +6389,757 @@ describe("subagent chain", () => {
       }
       testApi.chainHooks.runStep = original;
     }
+  });
+});
+
+// ── subagent_stop: graceful chain cancellation ──────────────────────────────
+//
+// A stop has to land at an exact moment — while a step is running, and in the
+// gap between two steps — and a real LLM-driven chain cannot be parked at either
+// point without the test becoming a race against model latency. So these cases
+// drive the chain STATE MACHINE directly: `startChain()` plus a stubbed
+// `chainHooks.runStep`, exactly like the chain suite above, with
+// `subagentOps.launch`/`watch` stubbed to fail loudly so not one of them can
+// open a pane or call a model. That is where everything the feature changes
+// lives — the `cancelled` flag, the driver's two guards, the steer to the
+// running step, and the single aggregate result. The tmux path itself (a pane, a
+// child pi, a typed message) is the same `deliverSubagentSteer` the
+// `subagent_message` tests exercise.
+describe("subagent_stop (graceful chain cancellation)", () => {
+  const testApi = (subagentsModule as any).__test__;
+
+  let sessionDir: string;
+  let sessionId: string;
+  let sentCommands: Array<{ surface: string; command: string }>;
+  let launchGuard: { calls: any[]; restore: () => void };
+  /** A `send` that records pane writes instead of running tmux. */
+  function recordingSend(surface: string, command: string) {
+    sentCommands.push({ surface, command });
+  }
+  /** A `send` that fails like a closed pane does — every write throws. */
+  function failingSend(surface: string, _command: string) {
+    sentCommands.push({ surface, command: "«throws»" });
+    throw new Error(`no such pane: ${surface}`);
+  }
+
+  const saved = {
+    agent: process.env.PI_SUBAGENT_AGENT,
+    allowed: process.env.PI_SUBAGENT_ALLOWED,
+  };
+
+  beforeEach(() => {
+    sessionDir = createTestDir();
+    sessionId = `sess-stop-${Math.random().toString(36).slice(2)}`;
+    sentCommands = [];
+    delete process.env.PI_SUBAGENT_AGENT;
+    delete process.env.PI_SUBAGENT_ALLOWED;
+    launchGuard = forbidRealLaunches();
+  });
+
+  afterEach(() => {
+    launchGuard?.restore();
+    restoreEnvVar("PI_SUBAGENT_AGENT", saved.agent);
+    restoreEnvVar("PI_SUBAGENT_ALLOWED", saved.allowed);
+    testApi.stopTimersForTest();
+    // Rows this suite registered, so a leftover name cannot make a later test's
+    // lookup ambiguous.
+    for (const id of [...testApi.runningSubagents.keys()]) {
+      if (testApi.runningSubagents.get(id).parentSessionId === sessionId) {
+        testApi.runningSubagents.delete(id);
+      }
+    }
+    clearChainsForTest();
+    try {
+      rmSync(sessionDir, { recursive: true, force: true });
+    } catch {}
+  });
+
+  function mockCtx() {
+    return {
+      sessionManager: {
+        getSessionFile: () => join(sessionDir, "session.jsonl"),
+        getSessionId: () => sessionId,
+        getSessionDir: () => sessionDir,
+      },
+      cwd: sessionDir,
+    } as any;
+  }
+
+  /** Start the chain driver exactly as the `subagent` tool would. */
+  function startTestChain(
+    name: string,
+    steps: Array<{ agent: string; task: string; name?: string }>,
+    sentMessages: any[],
+  ): any {
+    const api = {
+      on() {},
+      registerTool() {},
+      registerCommand() {},
+      registerMessageRenderer() {},
+      registerShortcut() {},
+      getAllTools: () => [],
+      sendUserMessage() {},
+      sendMessage(message: any, options?: any) {
+        sentMessages.push({ message, options });
+      },
+    };
+    const result = testApi.startChain(
+      { name, chain: steps },
+      new Set(["worker", "reviewer", "scout"]),
+      "worker, reviewer, scout",
+      undefined,
+      mockCtx(),
+      api,
+    );
+    assert.equal(result.details?.error, undefined, `chain start failed: ${JSON.stringify(result.details)}`);
+    const chain = testApi.getChainMapForSession(sessionId).get(name);
+    assert.ok(chain, `chain "${name}" should be tracked for this session`);
+    return chain;
+  }
+
+  /** A row in `runningSubagents`, as a real launch would leave it. */
+  function makeStopRunning(name: string, agent: string) {
+    const nonce = Math.random().toString(36).slice(2);
+    const fake: any = {
+      id: `fake-${nonce}`,
+      name,
+      agent,
+      task: "t",
+      surface: "%stub",
+      startTime: Date.now(),
+      sessionFile: join(sessionDir, `sub-${name}-${nonce}.jsonl`),
+      parentSessionId: sessionId,
+      interactive: false,
+    };
+    fake.statusState = createStatusState({ source: "pi", startTimeMs: fake.startTime });
+    return fake;
+  }
+
+  /**
+   * A chain that never runs — for the branches a live driver cannot be parked
+   * in (a handle looked up while nothing at all is running).
+   */
+  function syntheticChain(
+    name: string,
+    opts: {
+      steps: Array<{ agent: string; status: string; name?: string }>;
+      currentStep?: number;
+      currentRunning?: any;
+      finished?: boolean;
+      aborted?: boolean;
+    },
+  ): any {
+    const chain: any = {
+      name,
+      steps: opts.steps.map((s, i) => ({
+        index: i + 1,
+        agent: s.agent,
+        task: `task ${i + 1}`,
+        status: s.status,
+        ...(s.name ? { name: s.name } : {}),
+      })),
+      currentStep: opts.currentStep ?? 0,
+      currentRunning: opts.currentRunning ?? null,
+      startTime: Date.now(),
+      finished: opts.finished ?? false,
+      aborted: opts.aborted ?? false,
+      cancelled: false,
+      surfaceLost: false,
+      abortController: new AbortController(),
+    };
+    testApi.getChainMapForSession(sessionId).set(name, chain);
+    return chain;
+  }
+
+  /** Call the tool's body exactly as `subagent_stop` does. */
+  function stopByName(name: string, send: (surface: string, command: string) => void = recordingSend, sid = sessionId) {
+    return testApi.handleSubagentStop({ name }, send, sid);
+  }
+
+  async function waitForStop(cond: () => boolean, what: string, timeoutMs = 5000) {
+    const started = Date.now();
+    while (Date.now() - started < timeoutMs) {
+      if (cond()) return;
+      await chainSleep(10);
+    }
+    throw new Error(`Timed out waiting for: ${what}`);
+  }
+
+  it("registers subagent_stop with a single required `name` param", () => {
+    const { api, registeredTools } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const stopTool = registeredTools.find((tool) => tool.name === "subagent_stop");
+    assert.ok(stopTool, "expected the subagent_stop tool to be registered");
+    const props = stopTool.parameters.properties;
+    assert.deepEqual(Object.keys(props), ["name"], "only `name` is a parameter");
+    assert.equal(props.name.type, "string");
+    assert.deepEqual(stopTool.parameters.required, ["name"], "`name` is required");
+  });
+
+  it("grants subagent_stop to an agent that may spawn, so the chain ack's advice is callable", () => {
+    // The chain acknowledgement tells EVERY caller to cancel with subagent_stop.
+    // A child with `subagent_agents` is launched with an explicit tool allowlist,
+    // so unless the tool is part of the granted spawning toolset that advice
+    // would point at a tool the child does not have.
+    const allowlist = testApi.buildSubagentToolAllowlist("bash", { grantSpawning: true });
+    const tools = new Set(allowlist!.split(","));
+    for (const t of ["subagent", "subagent_message", "subagent_stop", "subagents_list"]) {
+      assert.ok(tools.has(t), `the spawning toolset must include ${t}`);
+    }
+  });
+
+  it("stops a chain while a step is running: the step is steered, nothing is aborted, no later step runs", async () => {
+    const original = testApi.chainHooks.runStep;
+    const calls: string[] = [];
+    const sentMessages: any[] = [];
+    let stepOne: any = null;
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    testApi.chainHooks.runStep = async (step: any, _ctx: any, parentArtifactDir: any, _pi: any, _signal: AbortSignal, hooks: any) => {
+      calls.push(step.agent);
+      const running = makeStopRunning(step.name, step.agent);
+      stepOne = running;
+      testApi.runningSubagents.set(running.id, running);
+      hooks.onLaunched(running);
+      registerName(parentArtifactDir, step.name, {
+        sessionFile: join(sessionDir, `sub-${step.name}.jsonl`),
+        sessionId: null,
+      });
+      // The stop is expected to arrive while the FIRST step is live. (`runStep`
+      // receives the launch params, not the step record, so a stub keys off the
+      // call order rather than a step index.)
+      if (calls.length === 1) await gate;
+      // The child never got the message (or ignored it) and dies non-zero.
+      return { name: step.name, summary: `SUMMARY-${step.agent}`, exitCode: 1, elapsed: 1 };
+    };
+
+    try {
+      const chain = startTestChain("stop-running", [
+        { agent: "worker", task: "implement it" },
+        { agent: "reviewer", task: "review it" },
+      ], sentMessages);
+      await waitForStop(() => chain.currentStep === 1 && !!chain.currentRunning, "step 1 to be running");
+
+      const result = stopByName("stop-running");
+
+      assert.equal(result.details.status, "cancelled");
+      assert.equal(result.details.chainName, "stop-running");
+      assert.equal(result.details.stepIndex, 1, "the interrupted step is reported");
+      assert.equal(result.details.stepTotal, 2);
+      assert.equal(result.details.remainingSteps, 1, "one later step will be skipped");
+      assert.deepEqual(result.details.skippedSteps, ["reviewer"]);
+      assert.equal(result.details.interrupted, stepOne.name);
+      assert.equal(result.details.steered, "typed", "the stop was typed into the running step's pane");
+      assert.equal(sentCommands.length, 1, "exactly one steer is typed");
+      assert.equal(sentCommands[0].surface, stepOne.surface);
+      assert.match(sentCommands[0].command, /STOP/);
+      assert.match(sentCommands[0].command, /stop-running/);
+      assert.match(result.content[0].text, /step 1\/2/);
+      assert.match(result.content[0].text, /will not run: reviewer/);
+
+      // Graceful-only: no abort of the chain or the child, no C-c, no pane close.
+      assert.equal(chain.cancelled, true);
+      assert.equal(chain.aborted, false, "an explicit stop is not a shutdown abort");
+      assert.equal(chain.abortController.signal.aborted, false, "the chain's controller is never aborted");
+      assert.ok(
+        !stepOne.abortController || stepOne.abortController.signal.aborted === false,
+        "the running child's watcher is untouched",
+      );
+
+      release();
+      await waitForStop(() => chain.finished, "the chain to finish");
+
+      assert.deepEqual(calls, ["worker"], "no later step may start once the chain is cancelled");
+      assert.equal(sentMessages.length, 1, "exactly one aggregate steer for the chain");
+      const steer = sentMessages[0].message;
+      assert.equal(steer.customType, "subagent_result");
+      assert.equal(steer.details.chain, true);
+      assert.equal(steer.details.cancelled, true);
+      assert.equal(steer.details.stopRequested, true, "and WHICH teardown ended it");
+      assert.equal(steer.details.exitCode, 1);
+      assert.deepEqual(steer.details.steps.map((s: any) => s.status), ["failed", "skipped"]);
+      assert.match(steer.content, /was cancelled \(stop requested\)/);
+      // The step did not obey the stop — the head says how it actually ended,
+      // the way the failed-step head always has.
+      assert.match(steer.content, /did not stop for the cancel — exit code 1/);
+      assert.doesNotMatch(steer.content, /parent session shut down/, "the shutdown copy is not reused");
+    } finally {
+      release();
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("does not run the next step when the cancelled step obeys the stop and exits 0", async () => {
+    // The regression this exists for: a child that obeys "stop" exits CLEANLY,
+    // which the driver counts as a successful step — without a `cancelled` check
+    // after step classification the loop would fall through to the next iteration
+    // and launch step N+1 (the loop-top guard is the second line of defence for
+    // the same outcome, so these assertions pin the observable behaviour: the
+    // obeyed step is the last one that runs, and what never ran says `skipped`).
+    const original = testApi.chainHooks.runStep;
+    const calls: string[] = [];
+    const sentMessages: any[] = [];
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    testApi.chainHooks.runStep = async (step: any, _ctx: any, parentArtifactDir: any, _pi: any, _signal: AbortSignal, hooks: any) => {
+      calls.push(step.agent);
+      const running = makeStopRunning(step.name, step.agent);
+      testApi.runningSubagents.set(running.id, running);
+      hooks.onLaunched(running);
+      registerName(parentArtifactDir, step.name, {
+        sessionFile: join(sessionDir, `sub-${step.name}.jsonl`),
+        sessionId: null,
+      });
+      if (calls.length === 1) await gate;
+      // Obeyed the stop: a short summary and a clean exit.
+      return {
+        name: step.name,
+        summary: calls.length === 1 ? "Stopped as requested. I finished the edit; I did not run tests." : "S2",
+        exitCode: 0,
+        elapsed: 1,
+      };
+    };
+
+    try {
+      const chain = startTestChain("stop-obeyed", [
+        { agent: "worker", task: "implement it" },
+        { agent: "reviewer", task: "review it" },
+        { agent: "worker", task: "apply the review" },
+      ], sentMessages);
+      await waitForStop(() => chain.currentStep === 1 && !!chain.currentRunning, "step 1 to be running");
+
+      const result = stopByName("stop-obeyed");
+      assert.equal(result.details.steered, "typed");
+      assert.equal(result.details.remainingSteps, 2);
+      release();
+      await waitForStop(() => chain.finished, "the chain to finish");
+
+      assert.deepEqual(calls, ["worker"], "the obeyed step must be the LAST step that runs");
+      assert.equal(sentMessages.length, 1, "exactly one aggregate steer for the chain");
+      const steer = sentMessages[0].message;
+      assert.equal(steer.details.cancelled, true);
+      // The interrupted step really did complete — it is reported as it ended,
+      // not rewritten to "cancelled"; only the steps that never started are skipped.
+      assert.deepEqual(steer.details.steps.map((s: any) => s.status), ["completed", "skipped", "skipped"]);
+      assert.match(steer.content, /was cancelled \(stop requested\)\. 1\/3 steps completed/);
+      assert.match(steer.content, /Not run \(chain stopped early\): reviewer, worker/);
+      assert.equal(result.content[0].text.includes("The aggregate chain result"), true);
+    } finally {
+      release();
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("stops a chain between steps: the flag alone ends it, and nothing is typed anywhere", async () => {
+    const original = testApi.chainHooks.runStep;
+    const calls: string[] = [];
+    const sentMessages: any[] = [];
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    testApi.chainHooks.runStep = async (step: any, _ctx: any, _parentArtifactDir: any, _pi: any, _signal: AbortSignal, hooks: any) => {
+      calls.push(step.agent);
+      if (calls.length === 1) {
+        const running = makeStopRunning(step.name, step.agent);
+        testApi.runningSubagents.set(running.id, running);
+        // The row becomes the chain's current one and then EXITS cleanly: the
+        // driver leaves `currentRunning` set until the whole chain ends, which is
+        // exactly the trap this test pins.
+        hooks.onLaunched(running);
+        return { name: step.name, summary: "S1", exitCode: 0, elapsed: 1 };
+      }
+      // Step 2 is entered but not launched yet: no `currentRunning`, which is
+      // the window a chain can only be reached through its own handle.
+      await gate;
+      return { name: step.name, summary: "S2", exitCode: 0, elapsed: 1 };
+    };
+
+    try {
+      const chain = startTestChain("stop-between", [
+        { agent: "worker", task: "implement it" },
+        { agent: "reviewer", task: "review it" },
+        { agent: "scout", task: "summarize it" },
+      ], sentMessages);
+      await waitForStop(() => calls.length === 2 && chain.currentStep === 2, "the gap between steps 1 and 2");
+
+      const result = stopByName("stop-between");
+      assert.equal(result.details.status, "cancelled");
+      assert.equal(result.details.steered, false, "nothing was running, so nothing was typed");
+      assert.equal(sentCommands.length, 0, "not a single pane write");
+      assert.equal(result.details.stepIndex, 2);
+      assert.equal(result.details.stepTotal, 3);
+      assert.equal(result.details.remainingSteps, 1);
+      assert.match(result.content[0].text, /No step was running/);
+      assert.match(result.content[0].text, /If a step had already started it runs to its end and is the last one/);
+
+      release();
+      await waitForStop(() => chain.finished, "the chain to finish");
+
+      assert.deepEqual(calls, ["worker", "reviewer"], "step 3 must not start");
+      assert.equal(sentMessages.length, 1, "exactly one aggregate steer for the chain");
+      assert.equal(sentMessages[0].message.details.cancelled, true);
+      assert.deepEqual(
+        sentMessages[0].message.details.steps.map((s: any) => s.status),
+        ["completed", "completed", "skipped"],
+      );
+    } finally {
+      release();
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("cancels the whole chain when a step's name is passed while that step is not running", async () => {
+    // The documented rule is that ANY step name addresses the chain. Between two
+    // steps — and for a step that has not started yet — no running row answers
+    // to that name, so resolution must not stop at the running map.
+    const original = testApi.chainHooks.runStep;
+    const calls: string[] = [];
+    const sentMessages: any[] = [];
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    testApi.chainHooks.runStep = async (step: any, _ctx: any, _parentArtifactDir: any, _pi: any, _signal: AbortSignal, hooks: any) => {
+      calls.push(step.agent);
+      const running = makeStopRunning(step.name, step.agent);
+      testApi.runningSubagents.set(running.id, running);
+      hooks.onLaunched(running);
+      if (calls.length === 1) await gate;
+      return { name: step.name, summary: "S", exitCode: 0, elapsed: 1 };
+    };
+
+    const nonce = `sp${Math.random().toString(36).slice(2, 8)}`;
+    try {
+      const chain = startTestChain(`${nonce}-chain`, [
+        { agent: "worker", task: "implement it", name: `${nonce}-one` },
+        { agent: "reviewer", task: "review it", name: `${nonce}-two` },
+      ], sentMessages);
+      await waitForStop(() => chain.currentStep === 1 && !!chain.currentRunning, "step 1 to be running");
+
+      // Step 2 has not started and no row answers to its name: it is still an
+      // address of the chain.
+      const byFutureStep = stopByName(`${nonce}-two`);
+      assert.equal(byFutureStep.details.status, "cancelled");
+      assert.equal(byFutureStep.details.chainName, `${nonce}-chain`, "a not-yet-started step names its chain");
+      assert.equal(byFutureStep.details.steered, "typed", "the RUNNING step is the one told to stop");
+      assert.equal(sentCommands.length, 1);
+      assert.match(sentCommands[0].command, new RegExp(nonce));
+
+      release();
+      await waitForStop(() => chain.finished, "the chain to finish");
+      assert.deepEqual(calls, ["worker"], "step 2 never starts");
+      assert.deepEqual(sentMessages[0].message.details.steps.map((s: any) => s.status), ["completed", "skipped"]);
+    } finally {
+      release();
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("resolves names like subagent_stop documents: chain step → whole chain, single spawn → refused", () => {
+    const nonce = `rs${Math.random().toString(36).slice(2, 8)}`;
+
+    // (a) A CHAIN STEP's name cancels the whole chain and says which step was
+    // interrupted and how many steps will be skipped.
+    const stepRow = makeStopRunning(`${nonce}-reviewer-2`, "reviewer");
+    testApi.runningSubagents.set(stepRow.id, stepRow);
+    const chain = syntheticChain(`${nonce}-fix-auth`, {
+      steps: [
+        { agent: "worker", status: "completed", name: `${nonce}-worker` },
+        { agent: "reviewer", status: "running", name: stepRow.name },
+        { agent: "worker", status: "pending" },
+      ],
+      currentStep: 2,
+      currentRunning: stepRow,
+    });
+    // The row is only told which chain it belongs to by the driver, exactly as
+    // `chainWidgetPosition` does on a real launch.
+    stepRow.chainName = chain.name;
+    stepRow.chainStep = 2;
+    stepRow.chainStepTotal = 3;
+
+    const byStep = stopByName(stepRow.name);
+    assert.equal(byStep.details.status, "cancelled");
+    assert.equal(byStep.details.chainName, chain.name, "a step name cancels the whole chain");
+    assert.equal(byStep.details.stepIndex, 2);
+    assert.equal(byStep.details.stepTotal, 3);
+    assert.equal(byStep.details.remainingSteps, 1);
+    assert.equal(byStep.details.interrupted, stepRow.name);
+    assert.equal(chain.cancelled, true);
+    assert.equal(sentCommands.length, 1);
+    assert.match(sentCommands[0].command, new RegExp(chain.name));
+
+    // A second stop changes nothing and sends nothing new — because the first
+    // one actually REACHED the step (`stopSteerDelivered`).
+    const again = stopByName(chain.name);
+    assert.equal(again.details.status, "cancelled");
+    assert.equal(again.details.steered, false, "a repeat call is not a second delivery");
+    assert.equal(sentCommands.length, 1, "no second steer");
+    assert.match(again.content[0].text, /already told to stop by the earlier call/);
+
+    // (b) A plain, non-chain sub-agent is REFUSED rather than silently ignored.
+    const soloRow = makeStopRunning(`${nonce}-solo-scout`, "scout");
+    testApi.runningSubagents.set(soloRow.id, soloRow);
+    const solo = stopByName(soloRow.name);
+    assert.ok(solo.details.error, "stopping a single spawn is not supported");
+    assert.equal(solo.details.notAChain, true);
+    assert.match(solo.content[0].text, /single spawn, not a chain step/);
+    assert.match(solo.content[0].text, /subagent_message/);
+    assert.equal(sentCommands.length, 1, "the refusal types nothing into the pane");
+
+    // (c) A finished chain has nothing to cancel and points at its steps.
+    syntheticChain(`${nonce}-done-chain`, {
+      steps: [
+        { agent: "worker", status: "completed", name: `${nonce}-worker-9` },
+        { agent: "reviewer", status: "skipped" },
+      ],
+      finished: true,
+    });
+    const finished = stopByName(`${nonce}-done-chain`);
+    assert.match(finished.details.error, /chain finished/);
+    assert.match(finished.content[0].text, /has already finished/);
+    assert.match(finished.content[0].text, new RegExp(`${nonce}-worker-9`));
+
+    // (d) An unknown name gets an actionable error listing what DOES exist.
+    const unknown = stopByName(`${nonce}-nope`);
+    assert.match(unknown.content[0].text, new RegExp(`No running chain named "${nonce}-nope"`));
+    assert.match(unknown.content[0].text, new RegExp(chain.name), "the running chain is offered as the likely target");
+    assert.match(unknown.content[0].text, /names are exact/);
+
+    // (e) A chain that is genuinely between steps says so instead of claiming a
+    // step was interrupted — the state a live driver cannot be parked in.
+    const idle = syntheticChain(`${nonce}-idle-chain`, {
+      steps: [{ agent: "worker", status: "pending" }],
+      currentStep: 0,
+      currentRunning: null,
+    });
+    const stoppedIdle = stopByName(`${nonce}-idle-chain`);
+    assert.equal(idle.cancelled, true);
+    assert.match(stoppedIdle.content[0].text, /No step was running/);
+    assert.equal(sentCommands.length, 1, "still no pane write for a chain with nothing running");
+  });
+
+  it("cancels a ONE-step chain through its step's name instead of calling it a single spawn", () => {
+    // `normalizeChain` reports a single step as "not a chain", so the driver
+    // stamps no chain label on the row and the running-row path alone would
+    // refuse it as a plain spawn. The chain still exists and is still live.
+    const nonce = `sc${Math.random().toString(36).slice(2, 8)}`;
+    const row = makeStopRunning(`${nonce}-solo-step`, "worker");
+    testApi.runningSubagents.set(row.id, row);
+    const chain = syntheticChain(`${nonce}-one-chain`, {
+      steps: [{ agent: "worker", status: "running", name: row.name }],
+      currentStep: 1,
+      currentRunning: row,
+    });
+
+    const result = stopByName(row.name);
+    assert.equal(result.details.status, "cancelled");
+    assert.equal(result.details.chainName, chain.name, "the step name resolved to its chain");
+    assert.equal(result.details.chainName !== undefined, true);
+    assert.equal(chain.cancelled, true);
+    assert.equal(result.details.notAChain, undefined, "and it is not refused as a single spawn");
+    assert.equal(sentCommands.length, 1);
+  });
+
+  it("retries a STOP whose first delivery failed instead of claiming the step was told", () => {
+    // The flag ends the chain either way, but the reply must never say the child
+    // was informed when the pane write failed — and the next call has to try.
+    const row = makeStopRunning(`retry-step`, "worker");
+    testApi.runningSubagents.set(row.id, row);
+    const chain = syntheticChain("retry-chain", {
+      steps: [
+        { agent: "worker", status: "running", name: row.name },
+        { agent: "reviewer", status: "pending" },
+      ],
+      currentStep: 1,
+      currentRunning: row,
+    });
+
+    const failed = stopByName("retry-chain", failingSend);
+    assert.equal(failed.details.status, "cancelled", "the chain is cancelled even so");
+    assert.ok(failed.details.error, "and the failed write is reported");
+    assert.equal(chain.stopSteerDelivered, undefined, "nothing was ever delivered to the step");
+
+    const before = sentCommands.length;
+    const retried = stopByName("retry-chain", recordingSend);
+    assert.equal(retried.details.steered, "typed", "the second call delivers what the first could not");
+    assert.equal(sentCommands.length, before + 1, "exactly one more pane write");
+    assert.match(retried.content[0].text, /an earlier call set the flag but never reached it/);
+    assert.doesNotMatch(retried.content[0].text, /already told to stop/, "nothing that never happened is claimed");
+
+    // And a THIRD call, with the STOP delivered, really does hold back.
+    const third = stopByName("retry-chain", recordingSend);
+    assert.equal(third.details.steered, false);
+    assert.equal(sentCommands.length, before + 1, "no steer is repeated once it landed");
+    assert.match(third.content[0].text, /already told to stop by the earlier call/);
+  });
+
+  it("gives a step parked in ask_question the STOP as its pending answer", () => {
+    const row = makeStopRunning("asking-step", "worker");
+    testApi.runningSubagents.set(row.id, row);
+    const askedAt = Date.now() - 1000;
+    // The child's `.ask` signal: its existence plus an activity trail parked on
+    // ask_question is what routes the STOP to the sidecar instead of the pane.
+    writeFileSync(`${row.sessionFile}.ask`, JSON.stringify({ askedAt, question: "Which path?" }), "utf8");
+    const chain = syntheticChain("ask-chain", {
+      steps: [
+        { agent: "worker", status: "running", name: row.name },
+        { agent: "scout", status: "pending" },
+      ],
+      currentStep: 1,
+      currentRunning: row,
+    });
+
+    const result = stopByName("ask-chain");
+    assert.equal(result.details.status, "cancelled");
+    assert.equal(result.details.steered, "reply", "delivered through the .ask-reply sidecar");
+    assert.equal(sentCommands.length, 0, "nothing was typed into the pane");
+    assert.match(result.content[0].text, /blocked in ask_question/);
+
+    const replyPath = `${row.sessionFile}.ask-reply`;
+    assert.ok(existsSync(replyPath), "the reply sidecar was written");
+    const reply = JSON.parse(readFileSync(replyPath, "utf8"));
+    assert.equal(reply.askedAt, askedAt, "the pending question's askedAt is echoed back");
+    assert.match(reply.text, /STOP/);
+    assert.match(reply.text, /NOT that answer/, "and the text disowns being an answer");
+    assert.equal(chain.cancelled, true);
+    try {
+      unlinkSync(`${row.sessionFile}.ask`);
+      unlinkSync(replyPath);
+    } catch {}
+  });
+
+  it("cannot cancel another session's chain", () => {
+    const chain = syntheticChain("other-chain", {
+      steps: [{ agent: "worker", status: "pending" }],
+    });
+    const otherSession = `sess-other-${Math.random().toString(36).slice(2)}`;
+
+    const result = stopByName("other-chain", recordingSend, otherSession);
+    assert.ok(result.details.error, "refused");
+    assert.match(result.content[0].text, /No running chain named "other-chain" in this session/);
+    assert.equal(chain.cancelled, false, "the other session's chain is untouched");
+    assert.equal(sentCommands.length, 0);
+  });
+
+  it("reports an already-torn-down chain instead of typing a STOP into a dying pane", () => {
+    const row = makeStopRunning("doomed-step", "worker");
+    testApi.runningSubagents.set(row.id, row);
+    const chain = syntheticChain("doomed-chain", {
+      steps: [
+        { agent: "worker", status: "running", name: row.name },
+        { agent: "scout", status: "pending" },
+      ],
+      currentStep: 1,
+      currentRunning: row,
+      aborted: true,
+    });
+    chain.abortController.abort();
+
+    const result = stopByName("doomed-chain");
+    assert.match(result.content[0].text, /already being torn down \(its parent session shut down\)/);
+    assert.equal(sentCommands.length, 0, "nothing is typed into a pane being torn down");
+    assert.equal(chain.cancelled, false, "and no cancel is claimed on top of the teardown");
+  });
+
+  it("says so when a refused single spawn's name is ALSO a live chain's handle", () => {
+    // `subagent_message` reports this collision with a note plus
+    // `details.chainShadowed`; `subagent_stop` must not answer "there is no
+    // chain to cancel" while one is running under exactly that name.
+    const nonce = `sh${Math.random().toString(36).slice(2, 8)}`;
+    const chainName = `${nonce}-shadow`;
+    const row = makeStopRunning(chainName, "scout");
+    testApi.runningSubagents.set(row.id, row);
+    const chain = syntheticChain(chainName, {
+      steps: [
+        { agent: "worker", status: "pending", name: `${nonce}-later` },
+        { agent: "scout", status: "pending", name: `${nonce}-last` },
+      ],
+    });
+
+    const result = stopByName(chainName);
+    assert.ok(result.details.error, "the single spawn is still refused — nothing was stopped");
+    assert.equal(result.details.notAChain, true);
+    assert.equal(result.details.chainShadowed, true, "and the collision is visible to renderers");
+    assert.match(result.content[0].text, new RegExp(`is also an active chain \\\(${chain.steps.length} steps`));
+    assert.match(result.content[0].text, /Nothing was cancelled/);
+    assert.match(result.content[0].text, new RegExp(`subagent_stop\\(\\{ name: "${nonce}-later" \\}\\)`));
+    assert.equal(chain.cancelled, false, "the chain is not cancelled by a name the row owns");
+    assert.equal(sentCommands.length, 0, "and nothing is typed anywhere");
+
+    // The advice it was given works: a step name reaches the chain.
+    const byStep = stopByName(`${nonce}-later`);
+    assert.equal(byStep.details.status, "cancelled");
+    assert.equal(byStep.details.chainName, chainName);
+    assert.equal(chain.cancelled, true);
+  });
+
+  it("releases a cancelled chain's pending step names when the chain unwinds", async () => {
+    const original = testApi.chainHooks.runStep;
+    const sentMessages: any[] = [];
+    const nonce = `lk${Math.random().toString(36).slice(2, 8)}`;
+    const later = `${nonce}-later`;
+    let release: () => void = () => {};
+    const gate = new Promise<void>((r) => (release = r));
+    testApi.chainHooks.runStep = async (step: any, _ctx: any, _parentArtifactDir: any, _pi: any, _signal: AbortSignal, hooks: any) => {
+      const running = makeStopRunning(step.name, step.agent);
+      testApi.runningSubagents.set(running.id, running);
+      hooks.onLaunched(running);
+      if (step.agent === "worker") await gate;
+      return { name: step.name, summary: "S", exitCode: 0, elapsed: 1 };
+    };
+
+    try {
+      const chain = startTestChain(`${nonce}-locks`, [
+        { agent: "worker", task: "implement it", name: `${nonce}-now` },
+        { agent: "reviewer", task: "review it", name: later },
+      ], sentMessages);
+      await waitForStop(() => chain.currentStep === 1 && !!chain.currentRunning, "step 1 to be running");
+      // While the chain lives, the name its later step promised is spent.
+      assert.ok(testApi.findStepNameLockConflict(later, sessionId), "reserved while the chain runs");
+
+      stopByName(`${nonce}-locks`);
+      release();
+      await waitForStop(() => chain.finished, "the chain to finish");
+
+      // Checked on the reservations THEMSELVES, by chain identity: a stale lock
+      // would prune itself on the next read, so the lookup alone would pass even
+      // if the cancelled chain never released anything.
+      const held = [];
+      for (const map of testApi.stepNameLocks.values()) {
+        for (const [name, lock] of map) {
+          if (lock.chain === chain) held.push(name);
+        }
+      }
+      assert.deepEqual(held, [], "a cancelled chain releases every name its steps promised");
+      assert.equal(testApi.findStepNameLockConflict(later, sessionId), null);
+    } finally {
+      release();
+      testApi.chainHooks.runStep = original;
+    }
+  });
+
+  it("names in the widget what a stop did and did not do", () => {
+    // The renderer keys on `details`, and the two teardowns both set `cancelled`.
+    const { api, registeredMessageRenderers } = createMockExtensionApi();
+    (subagentsModule as any).default(api);
+    const entry = registeredMessageRenderers.find((r: any) => r.name === "subagent_result");
+    const theme: any = { fg: (_c: string, t: string) => t, bg: (_c: string, t: string) => t, bold: (t: string) => t };
+    const steps = [
+      { index: 1, agent: "worker", name: "w", status: "completed", summary: "S" },
+      { index: 2, agent: "reviewer", status: "skipped" },
+    ];
+    const render = (details: any) =>
+      entry
+        .renderer(
+          { role: "user", content: "x", details: { chain: true, name: "c", exitCode: 1, steps, ...details } },
+          // Expanded: the collapsed footer asks pi for keybinding hints, which
+          // needs a theme the test never initializes.
+          { expanded: true },
+          theme,
+        )
+        .render(100)
+        .join("\n");
+
+    assert.match(render({ cancelled: true, stopRequested: true }), /cancelled \(stop requested\)/);
+    assert.match(render({ cancelled: true }), /cancelled \(session shut down\)/);
+    assert.doesNotMatch(render({}), /cancelled/, "a chain that merely failed says nothing about cancelling");
   });
 });
 
