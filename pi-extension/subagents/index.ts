@@ -2931,9 +2931,10 @@ function steerSubagent(
  * Deliver a message to a running subagent.
  *
  * If the subagent is currently blocked in `ask_question` — its
- * `${sessionFile}.ask` signal file exists AND its latest activity is the
- * `ask_question` event (childIsAsking) — the message IS the orchestrator's
- * reply: it is written atomically (temp file + rename) to
+ * `${sessionFile}.ask` signal file exists AND the child's activity says the ask
+ * is still pending (`childIsAsking`, which reads the authoritative `askPending`
+ * marker and only falls back to `latestEvent` for older children) then the
+ * message IS the orchestrator's reply: it is written atomically (temp file + rename) to
  * `${sessionFile}.ask-reply` as JSON `{ askedAt, text }`, the `askedAt`
  * echoed from the `.ask` file so the child can reject a reply from a
  * different question cycle. Nothing is typed into the pane. Otherwise the
@@ -2942,27 +2943,45 @@ function steerSubagent(
  * Routing keys off the `.ask` file's existence (the parent cannot see the
  * child's in-memory state), so a `.ask` that outlives the wait would
  * misroute the next steer into the sidecar. That case is handled at the
- * source: the child unlinks `.ask` on abort/timeout/consumption, the
- * watcher unlinks both sidecars when the child's pane dies, and a resume
- * unlinks them before relaunching — with the activity cross-check as a
- * second line of defence for a live child that is not waiting.
+ * source: the child unlinks `.ask` and clears `askPending` on
+ * abort/timeout/consumption, the watcher unlinks both sidecars when the
+ * child's pane dies, and a resume unlinks them before relaunching, with the
+ * activity cross-check as a second line of defence for a live child that is not
+ * waiting. A steer that still ends up typed into the pane of a parked child is
+ * not lost either: the child's `input` handler answers the pending ask with it.
  */
 let askReplyTmpSeq = 0;
 
 /**
- * Cross-check the `.ask` signal against the child's latest activity: a
- * child blocked in `ask_question` has parked its activity at
- * `latestEvent: "ask_question"`. A stale `.ask` (the child is no longer
- * waiting) must not turn a plain steer into a swallowed reply. When the
- * activity is unknown (file missing/unreadable) the `.ask` file itself —
- * which the child writes immediately before blocking — is trusted.
+ * Cross-check the `.ask` signal against what the child says about itself. A
+ * current child publishes `askPending` -- an explicit ask-lifecycle marker that
+ * no telemetry event touches -- so a parked ask stays routable even when a
+ * sibling tool in the same parallel batch (or text typed into the pane) moved
+ * `latestEvent` off `ask_question`. Without that field the parent would steer
+ * the reply into the pane, where pi cannot hand it to a pending tool call, and
+ * the child would hang until its timeout while the ack said "Reply delivered".
+ *
+ * Three cases, in order of trust:
+ *  - the activity file HAS the `askPending` key: it is authoritative, truthy
+ *    means asking, an explicit `null` means NOT asking (a consumed, aborted or
+ *    timed-out ask, or a finished session);
+ *  - the key is absent: the child predates the field, so fall back to the old
+ *    `latestEvent === "ask_question"` heuristic;
+ *  - no activity file / unreadable / wrong id: nothing to go on, so trust the
+ *    `.ask` signal, which the child writes immediately before blocking.
+ *
+ * A stale `.ask` (the child is no longer waiting) must still not turn a plain
+ * steer into a swallowed reply: the child clears the marker on every exit path
+ * of its wait, and `askAnswered`/`markDone` write the explicit `null`.
  */
 function childIsAsking(running: RunningSubagent): boolean {
   const activityFile = running.activityFile;
   if (!activityFile) return true; // unknown → trust the .ask signal
   const read = readSubagentActivityFile(activityFile, running.id);
   if (!read.ok) return true; // unknown → trust the .ask signal
-  return read.activity.latestEvent === "ask_question";
+  const activity = read.activity;
+  if ("askPending" in activity) return activity.askPending != null;
+  return activity.latestEvent === "ask_question"; // legacy child: telemetry only
 }
 
 function deliverSubagentSteer(
@@ -3929,7 +3948,9 @@ function copyClaudeSession(sentinelFile: string): string | null {
  * The `.ask` file is deliberately NOT deleted here: the subagent's blocking
  * `ask_question` call consumes the reply and unlinks the file itself, and the
  * parent's `subagent_message` checks for the file (plus the child's activity,
- * via childIsAsking) to route a reply into the
+ * via childIsAsking, which reads the child's authoritative `askPending` marker
+ * and only falls back to `latestEvent` for children that predate it) to route a
+ * reply into the
  * `${sessionFile}.ask-reply` sidecar. Notification is still once per question
  * — deduped by the payload content key (`lastNotifiedAsk`), so an unchanged
  * lingering file does not re-notify, while a new question (or a re-ask)
@@ -3941,7 +3962,10 @@ function copyClaudeSession(sentinelFile: string): string | null {
  * handled at the source — the child unlinks `.ask` on abort, the watcher
  * unlinks both sidecars when the pane dies, and a resume unlinks them
  * before relaunching — with the activity cross-check as a second line of
- * defence for a live child that is not waiting.
+ * defence for a live child that is not waiting. The cross-check reads the
+ * child's `askPending` marker (see `childIsAsking`), which is what keeps a
+ * parked ask recognisable even when a sibling tool in the same parallel batch
+ * moved `latestEvent` off `ask_question`.
  *
  * A `.ask` file that keeps failing to parse (e.g. the child died mid-write)
  * is given up on: after a few consecutive parse failures the file is

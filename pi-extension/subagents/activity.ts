@@ -44,6 +44,23 @@ export interface SubagentActivityState {
   toolName?: string;
   toolStartedAt?: number;
   toolEndedAt?: number;
+  /**
+   * Authoritative "this child is parked in `ask_question` right now" marker.
+   *
+   * Deliberately NOT telemetry: only the ask lifecycle writes it -- `askQuestion()`
+   * sets it, `askAnswered()` (reply consumed / aborted / timed out) and `markDone()`
+   * clear it. Telemetry events (`input`, `tool_result`, `tool_execution_end`,
+   * `message_update`, ...) never touch it, because pi runs tool batches in parallel:
+   * a sibling tool's result overwrites `latestEvent` while the ask is still parked,
+   * which made `latestEvent` useless as the parent's reply-routing key. The parent
+   * reads this field instead (see `childIsAsking` in index.ts).
+   *
+   * The THREE states are distinct on purpose: `{ askedAt }` = asking; `null` = a
+   * child that knows about this field and is NOT asking; key ABSENT = a child that
+   * predates the field, so the parent must fall back to the legacy
+   * `latestEvent === "ask_question"` heuristic.
+   */
+  askPending?: { askedAt: number } | null;
 }
 
 export type ActivityReadResult =
@@ -69,7 +86,8 @@ export interface SubagentActivityRecorder {
   toolExecutionUpdate(toolCallId?: string, toolName?: string): void;
   toolResult(toolCallId?: string, toolName?: string): void;
   toolExecutionEnd(toolCallId?: string, toolName?: string): void;
-  askQuestion(): void;
+  askQuestion(askedAt?: number): void;
+  askAnswered(): void;
   sessionShutdown(reason: SubagentShutdownReason): void;
 }
 
@@ -137,6 +155,20 @@ function validateOptionalActivityString(object: Record<string, unknown>, fieldNa
   return value.length <= MAX_ACTIVITY_STRING_LENGTH ? null : `${fieldName} is too long`;
 }
 
+/**
+ * Validate the ask-lifecycle marker. Absent means a legacy file (written before
+ * the field existed) and stays absent -- the parent distinguishes it from an
+ * explicit `null` (a current child that is not asking).
+ */
+function validateAskPending(object: Record<string, unknown>): string | null {
+  if (!("askPending" in object)) return null;
+  const value = object.askPending;
+  if (value == null) return null; // explicitly cleared, not a malformed value
+  const pending = requireObject(value);
+  if (!pending) return "askPending must be null or an object when present";
+  return validateFiniteNumber(pending, "askedAt");
+}
+
 function invalidActivity(error: string): ActivityReadResult {
   return { ok: false, reason: "invalid", error };
 }
@@ -176,6 +208,7 @@ function validateActivity(value: unknown, expectedRunningChildId: string): Activ
     validateOptionalActivityString(object, "messageEventType"),
     validateOptionalActivityString(object, "toolCallId"),
     validateOptionalActivityString(object, "toolName"),
+    validateAskPending(object),
   ].find((error) => error != null);
   if (validationError) return invalidActivity(validationError);
 
@@ -237,6 +270,7 @@ function createNoopRecorder(): SubagentActivityRecorder {
     toolResult() {},
     toolExecutionEnd() {},
     askQuestion() {},
+    askAnswered() {},
     sessionShutdown() {},
   };
 }
@@ -378,8 +412,34 @@ export function createSubagentActivityRecorder(params: {
       current.phase = "done";
       clearActiveState(current);
       delete current.waitingSince;
+      // A finished child is never waiting on a question. Write the key as an
+      // explicit null (rather than deleting it) so the parent's reply routing
+      // sees "not asking" instead of falling back to stale telemetry.
+      current.askPending = null;
     }, "immediate");
     disable();
+  }
+
+  /**
+   * End the ask marker. This is a lifecycle write, NOT telemetry: `latestEvent`
+   * keeps whatever the last real event was, so the answered snapshot cannot be
+   * mistaken for an `ask_question` park by a parent that only looks at
+   * telemetry. No-op when no ask is (or ever was) recorded, so a session that
+   * never asks never grows the key.
+   *
+   * Known version skew, accepted: the snapshot left here still reads
+   * `latestEvent: "ask_question"` / `phase: "waiting"` until the next telemetry
+   * event, so a parent built from an OLDER package -- one that routes replies on
+   * the `latestEvent` heuristic alone -- would keep steering into the sidecar
+   * for that window. A current parent trusts the `null` and routes correctly.
+   * Parent and child always ship from this package, so no compatibility shim is
+   * worth the ambiguity of rewriting telemetry from a lifecycle write.
+   */
+  function clearAskPending(): void {
+    if (activity.askPending == null) return;
+    record(activity.latestEvent, (current) => {
+      current.askPending = null;
+    }, "immediate");
   }
 
   return {
@@ -493,19 +553,37 @@ export function createSubagentActivityRecorder(params: {
         refreshActiveScope(current);
       }, "immediate");
     },
-    askQuestion() {
+    askQuestion(askedAt) {
       // The subagent paused to ask the orchestrator a question. Park it in the
       // "waiting" phase (do NOT disable the recorder) so the status widget shows
       // it as waiting and recording resumes when the answer arrives.
+      //
+      // `askPending` is the part the parent routes replies off: `latestEvent`
+      // only says "the ask was the last thing recorded", and sibling telemetry
+      // from a parallel tool batch moves it off `ask_question` while the ask is
+      // still parked. Pass the cycle's `askedAt` (the value written into the
+      // `.ask` sidecar) so the marker names the question it belongs to.
       record("ask_question", (current, observedAt) => {
         clearActiveState(current);
         current.phase = "waiting";
         current.waitingSince = observedAt;
+        current.askPending = { askedAt: askedAt ?? observedAt };
       }, "immediate");
     },
+    askAnswered() {
+      // The ask ended: reply consumed, aborted, or timed out.
+      clearAskPending();
+    },
     sessionShutdown(reason) {
-      if (reason === "quit") markDone("session_shutdown");
-      else disable();
+      if (reason === "quit") {
+        markDone("session_shutdown");
+        return;
+      }
+      // Not a final done snapshot, but a parked ask must not outlive the
+      // session: a child that is reloading/resuming/forking cannot consume a
+      // reply either, so clear the marker before recording stops.
+      clearAskPending();
+      disable();
     },
   };
 }

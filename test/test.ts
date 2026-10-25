@@ -51,6 +51,7 @@ import {
   createSubagentActivityRecorder,
   getSubagentActivityFile,
   readSubagentActivityFile,
+  writeSubagentActivityFile,
 } from "../pi-extension/subagents/activity.ts";
 import {
   shouldMarkUserTookOver,
@@ -2345,7 +2346,10 @@ describe("subagent-done.ts", () => {
     // session must park (not exit) at agent_end, and once the reply (or
     // timeout) is consumed the flag is cleared INSIDE the tool — the reply
     // does not start a new turn, so no input/agent_start clear can fire.
-    function setupCapturingExtension(sessionFile: string) {
+    // Passing `activityFile` also arms the child's activity recorder, so a test
+    // can watch the authoritative `askPending` marker exactly as the PARENT
+    // reads it while the call is parked.
+    function setupCapturingExtension(sessionFile: string, activityFile?: string) {
       const handlers = new Map<string, Array<(...args: any[]) => void>>();
       const tools: any[] = [];
       const api = {
@@ -2362,19 +2366,31 @@ describe("subagent-done.ts", () => {
         name: process.env.PI_SUBAGENT_NAME,
         agent: process.env.PI_SUBAGENT_AGENT,
         autoExit: process.env.PI_SUBAGENT_AUTO_EXIT,
+        id: process.env.PI_SUBAGENT_ID,
+        activity: process.env.PI_SUBAGENT_ACTIVITY_FILE,
       };
       process.env.PI_SUBAGENT_SESSION = sessionFile;
       process.env.PI_SUBAGENT_NAME = "scout-2";
       process.env.PI_SUBAGENT_AGENT = "scout";
       process.env.PI_SUBAGENT_AUTO_EXIT = "1";
+      if (activityFile) {
+        // Both are required: without an id the recorder stays a no-op.
+        process.env.PI_SUBAGENT_ID = "child-ask";
+        process.env.PI_SUBAGENT_ACTIVITY_FILE = activityFile;
+      }
       subagentDoneExtension(api);
-      const emit = (event: string, ...args: any[]) =>
-        (handlers.get(event) ?? []).forEach((h) => h(...args));
+      // Each handler's return value is passed through so a test can assert the
+      // `input` handler's `{ action: "handled" }` short-circuit; callers that
+      // only fire an event ignore it.
+      const emit = (event: string, ...args: any[]): any[] =>
+        (handlers.get(event) ?? []).map((h) => h(...args));
       const restore = () => {
         restoreEnvVar("PI_SUBAGENT_SESSION", saved.session);
         restoreEnvVar("PI_SUBAGENT_NAME", saved.name);
         restoreEnvVar("PI_SUBAGENT_AGENT", saved.agent);
         restoreEnvVar("PI_SUBAGENT_AUTO_EXIT", saved.autoExit);
+        restoreEnvVar("PI_SUBAGENT_ID", saved.id);
+        restoreEnvVar("PI_SUBAGENT_ACTIVITY_FILE", saved.activity);
       };
       const ask = (signal?: AbortSignal) => {
         const tool = tools.find((t) => t.name === "ask_question");
@@ -2542,6 +2558,342 @@ describe("subagent-done.ts", () => {
           assert.ok(!existsSync(`${sessionFile}.ask`), "sidecars cleaned up on consumption");
           assert.ok(!existsSync(`${sessionFile}.ask-reply`), "sidecars cleaned up on consumption");
         });
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    // --- Fix 1: the `input` event is a second reply channel -----------------
+    // pi never delivers steering text into a pending tool call (it polls for
+    // steering at the turn boundary, after the whole tool batch finishes), so
+    // text that lands in a parked child's pane - a steer the parent misrouted,
+    // or a human typing the answer - is otherwise queued while the call hangs
+    // until its timeout. The `input` handler must answer the parked call with
+    // it and report `handled` so pi absorbs the text instead of ALSO starting a
+    // turn the call can no longer return.
+    it("answers the parked question from an input event, without any reply sidecar", async () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const activityFile = join(dir, "activity.json");
+      const { emit, ask, restore } = setupCapturingExtension(sessionFile, activityFile);
+      try {
+        emit("agent_start");
+        await withAskTimings({ pollMs: 25, timeoutMs: 5_000 }, async () => {
+          const pending = ask();
+          await new Promise((resolve) => setTimeout(resolve, 20));
+
+          // While parked, the activity file the parent reads carries the
+          // authoritative marker for exactly this question cycle.
+          const askedAt = JSON.parse(readFileSync(`${sessionFile}.ask`, "utf8")).askedAt;
+          const parked = readSubagentActivityFile(activityFile, "child-ask");
+          assert.ok(parked.ok);
+          assert.deepEqual(parked.activity.askPending, { askedAt });
+
+          const handled = emit("input", {
+            type: "input",
+            text: "Use v1, with retries",
+            source: "interactive",
+          });
+          assert.deepEqual(
+            handled,
+            [{ action: "handled" }],
+            "the input handler absorbs the submitted text",
+          );
+
+          const out = await pending;
+          assert.equal(out.content[0].text, "Use v1, with retries", "the typed text IS the tool result");
+          assert.deepEqual(out.details, { question: "v1 or v2?", replied: true });
+          assert.ok(!existsSync(`${sessionFile}.ask`), "consumption unlinks .ask");
+          assert.ok(
+            !existsSync(`${sessionFile}.ask-reply`),
+            "the answer never needed a .ask-reply sidecar",
+          );
+          const answered = readSubagentActivityFile(activityFile, "child-ask");
+          assert.ok(answered.ok);
+          assert.equal(answered.activity.askPending, null, "consumption clears the ask marker");
+          assert.ok("askPending" in answered.activity, "cleared is explicit, not a missing key");
+
+          // The flag was cleared by consumption, so the turn exits normally.
+          let shutdown = false;
+          emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
+          assert.equal(shutdown, true, "answered in-turn -> agent_end exits, not parks");
+        });
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("stops absorbing input once the question is answered, so the next text is a normal turn", async () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, ask, restore } = setupCapturingExtension(sessionFile);
+      try {
+        emit("agent_start");
+        await withAskTimings({ pollMs: 25, timeoutMs: 5_000 }, async () => {
+          const pending = ask();
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          emit("input", { type: "input", text: "the answer", source: "interactive" });
+          const out = await pending;
+          assert.equal(out.content[0].text, "the answer");
+
+          const late = emit("input", { type: "input", text: "now do the rest", source: "interactive" });
+          assert.deepEqual(late, [undefined], "no short-circuit: this text belongs to a later turn");
+        });
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("prefers a just-arrived input answer over an abort in the same tick", async () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, ask, restore } = setupCapturingExtension(sessionFile);
+      try {
+        emit("agent_start");
+        const ac = new AbortController();
+        await withAskTimings({ pollMs: 25, timeoutMs: 5_000 }, async () => {
+          const pending = ask(ac.signal);
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          // Both land in the same tick, before the next poll: the answer is
+          // checked before the abort, exactly like a reply file that races
+          // Ctrl-C. Submitting and aborting synchronously (no timers) keeps the
+          // assertion about the CHECK ORDER, not about which timer wins.
+          emit("input", { type: "input", text: "answered first", source: "interactive" });
+          ac.abort();
+          const out = await pending;
+          assert.equal(out.content[0].text, "answered first");
+          assert.equal(out.details.replied, true);
+          assert.ok(!existsSync(`${sessionFile}.ask`), "sidecars cleaned up");
+        });
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("does not treat a text-less submission as an answer", async () => {
+      // The interactive pane trims and rejects empty input, but an rpc- or
+      // extension-sourced submission can arrive with no text. Answering the
+      // question with "" would silently drop whatever it carried, so the ask
+      // must stay parked and the next real text still answers it.
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, ask, restore } = setupCapturingExtension(sessionFile);
+      try {
+        emit("agent_start");
+        await withAskTimings({ pollMs: 25, timeoutMs: 5_000 }, async () => {
+          const pending = ask();
+          await new Promise((resolve) => setTimeout(resolve, 20));
+
+          const ignored = emit("input", { type: "input", source: "rpc" });
+          assert.deepEqual(ignored, [undefined], "not absorbed: there is no text to answer with");
+          assert.ok(existsSync(`${sessionFile}.ask`), "the question is still pending");
+
+          emit("input", { type: "input", text: "v2", source: "interactive" });
+          const out = await pending;
+          assert.equal(out.content[0].text, "v2", "the parked ask still takes the real answer");
+        });
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("refuses a second ask_question while one is already parked", async () => {
+      // pi runs the tool calls of one assistant message in parallel, so two
+      // ask_question calls CAN land in one batch. They would share the single
+      // `.ask`/`.ask-reply` pair and the single input handle, and the first to
+      // finish would tear down the other's reply channels -- so the second is
+      // refused. The refusal must also leave the parked ask alone: it is checked
+      // before any sidecar is touched.
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, ask, restore } = setupCapturingExtension(sessionFile);
+      try {
+        emit("agent_start");
+        await withAskTimings({ pollMs: 25, timeoutMs: 5_000 }, async () => {
+          const pending = ask();
+          await new Promise((resolve) => setTimeout(resolve, 20));
+
+          let error: any = null;
+          try {
+            await ask();
+            assert.fail("the second ask must be refused, not parked behind the first");
+          } catch (err) {
+            error = err;
+          }
+          assert.match(error.message, /already waiting for an answer/);
+          assert.ok(existsSync(`${sessionFile}.ask`), "the parked question is still signalled");
+
+          emit("input", { type: "input", text: "v1", source: "interactive" });
+          const out = await pending;
+          assert.equal(out.content[0].text, "v1", "its input channel survived the refusal");
+
+          // The guard releases with the ask, so the next question works.
+          const again = ask();
+          await new Promise((resolve) => setTimeout(resolve, 20));
+          emit("input", { type: "input", text: "answered later", source: "interactive" });
+          const second = await again;
+          assert.equal(second.content[0].text, "answered later");
+        });
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("keeps both answers when the sidecar reply and typed text arrive in one pass", async () => {
+      // The sidecar is read before the input channel, so with both present the
+      // typed text would be thrown away -- and it cannot fall back to a turn,
+      // because absorbing it was already reported to pi. Same for the file
+      // reply, which `consumeReply` unlinks. The call returns both.
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, ask, restore } = setupCapturingExtension(sessionFile);
+      try {
+        emit("agent_start");
+        // A poll interval wide enough that both answers land in the same pass.
+        await withAskTimings({ pollMs: 200, timeoutMs: 5_000 }, async () => {
+          const pending = ask();
+          await new Promise((resolve) => setTimeout(resolve, 30));
+
+          const askedAt = JSON.parse(readFileSync(`${sessionFile}.ask`, "utf8")).askedAt;
+          writeFileSync(
+            `${sessionFile}.ask-reply`,
+            JSON.stringify({ askedAt, text: "Use v2" }),
+          );
+          const handled = emit("input", {
+            type: "input",
+            text: "and ship it today",
+            source: "interactive",
+          });
+          assert.deepEqual(handled, [{ action: "handled" }], "the typed text was absorbed");
+
+          const out = await pending;
+          assert.match(out.content[0].text, /Use v2/, "the parent's sidecar reply is kept");
+          assert.match(
+            out.content[0].text,
+            /and ship it today/,
+            "the absorbed pane text is kept too",
+          );
+          assert.equal(out.details.replied, true);
+          assert.ok(!existsSync(`${sessionFile}.ask`), "both sidecars cleaned up");
+          assert.ok(!existsSync(`${sessionFile}.ask-reply`), "both sidecars cleaned up");
+        });
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("releases the park when it cannot even set the question up", async () => {
+      // The `.ask` write and the activity write happen before the wait loop's
+      // `finally` is entered. A failure there must not leave `awaitingAnswer`
+      // set (auto-exit suppressed forever) nor a `pendingAsk` handle (every
+      // later question refused, every later input absorbed).
+      const dir = createTestDir();
+      const sessionFile = join(dir, "gone", "s.jsonl"); // parent directory missing
+      const activityFile = join(dir, "activity.json");
+      const { emit, ask, restore } = setupCapturingExtension(sessionFile, activityFile);
+      try {
+        emit("session_start", {}, { ui: { setWidget() {} } });
+        emit("agent_start");
+        await withAskTimings({ pollMs: 25, timeoutMs: 5_000 }, async () => {
+          let error: any = null;
+          try {
+            await ask();
+            assert.fail("the failed .ask write must propagate");
+          } catch (err) {
+            error = err;
+          }
+          assert.ok(error, "the setup error reaches the model as a tool error");
+        });
+
+        const activity = readSubagentActivityFile(activityFile, "child-ask");
+        assert.ok(activity.ok, `activity should parse: ${(activity as any).error}`);
+        assert.equal(
+          "askPending" in activity.activity,
+          false,
+          "no ask marker for a question that never started",
+        );
+
+        let shutdown = false;
+        emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
+        assert.equal(shutdown, true, "a failed setup must not park the session");
+
+        // And the input channel is not stuck absorbing text as answers.
+        const absorbed = emit("input", { type: "input", text: "keep going", source: "interactive" });
+        assert.deepEqual(absorbed, [undefined], "nothing is parked, so nothing is absorbed");
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("clears the ask marker on abort and on timeout, so the parent stops replying", async () => {
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const activityFile = join(dir, "activity.json");
+      const { emit, ask, restore } = setupCapturingExtension(sessionFile, activityFile);
+      try {
+        emit("agent_start");
+        // Abort: the marker must go, or the parent keeps routing the orchestrator's
+        // next message into a sidecar nobody is reading.
+        const ac = new AbortController();
+        const pendingAbort = ask(ac.signal).then(
+          () => assert.fail("execute should throw on abort"),
+          (err: any) => err,
+        );
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        ac.abort();
+        const abortError = await pendingAbort;
+        assert.match(abortError.message, /Interrupted while waiting for the orchestrator reply/);
+        const afterAbort = readSubagentActivityFile(activityFile, "child-ask");
+        assert.ok(afterAbort.ok);
+        assert.equal(afterAbort.activity.askPending, null, "abort clears the ask marker");
+
+        // Timeout: same.
+        await withAskTimings({ pollMs: 25, timeoutMs: 120 }, async () => {
+          const out = await ask();
+          assert.match(out.content[0].text, /No reply from the orchestrator within/);
+        });
+        const afterTimeout = readSubagentActivityFile(activityFile, "child-ask");
+        assert.ok(afterTimeout.ok);
+        assert.equal(afterTimeout.activity.askPending, null, "timeout clears the ask marker");
+      } finally {
+        restore();
+        rmSync(dir, { recursive: true, force: true });
+      }
+    });
+
+    it("leaves the input handler's old behaviour alone while no question is pending", async () => {
+      // Non-regression for Fix 1: with nothing parked, an input is NOT treated
+      // as `handled`, and the defensive `awaitingAnswer` clear still runs (an
+      // aborted wait leaves the flag set; submitted text must still release it).
+      const dir = createTestDir();
+      const sessionFile = join(dir, "s.jsonl");
+      const { emit, ask, restore } = setupCapturingExtension(sessionFile);
+      try {
+        emit("agent_start");
+        const ac = new AbortController();
+        const pending = ask(ac.signal).then((out: any) => out, (err: any) => err);
+        await new Promise((resolve) => setTimeout(resolve, 20));
+        ac.abort();
+        assert.match((await pending).message, /Interrupted while waiting/);
+
+        let shutdown = false;
+        emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
+        assert.equal(shutdown, false, "the aborted wait still parks the session");
+
+        const results = emit("input", { type: "input", text: "keep going", source: "interactive" });
+        assert.deepEqual(results, [undefined], "no handled short-circuit while nothing is parked");
+
+        shutdown = false;
+        emit("agent_end", { messages: [] }, { shutdown() { shutdown = true; } });
+        assert.equal(shutdown, true, "input still clears the flag -> auto-exit resumes");
       } finally {
         restore();
         rmSync(dir, { recursive: true, force: true });
@@ -8102,6 +8454,9 @@ describe("subagent activity snapshots", () => {
         { runningChildId: 42 },
         { toolActive: "yes" },
         { toolName: "bad\nname" },
+        // askPending may only be an explicit null (cleared) or { askedAt }.
+        { askPending: "yes" },
+        { askPending: { askedAt: "soon" } },
       ];
 
       for (const [index, overrides] of cases.entries()) {
@@ -8159,6 +8514,190 @@ describe("subagent activity snapshots", () => {
       assert.ok(read.ok);
       assert.equal(read.activity.phase, "starting");
       assert.equal(read.activity.latestEvent, "session_start");
+    });
+  });
+
+  it("keeps askPending authoritative across unrelated telemetry until askAnswered", () => {
+    withTempDir((dir) => {
+      let currentNow = 1_000;
+      const activityFile = getSubagentActivityFile(dir, "child-ask");
+      const recorder = createSubagentActivityRecorder({
+        runningChildId: "child-ask",
+        activityFile,
+        now: () => currentNow,
+      });
+      const readState = () => {
+        const result = readSubagentActivityFile(activityFile, "child-ask");
+        assert.ok(result.ok, `activity should parse: ${(result as any).error}`);
+        return result.activity;
+      };
+
+      recorder.sessionStart();
+      // A child that never asked has NO key: the parent must keep using the
+      // legacy latestEvent heuristic for it instead of reading "not asking".
+      assert.equal("askPending" in readState(), false, "no key before the first ask");
+
+      recorder.agentStart();
+      recorder.turnStart(1);
+      recorder.toolExecutionStart("call-1", "ask_question");
+      currentNow = 2_000;
+      recorder.askQuestion(1_234);
+
+      let activity = readState();
+      assert.deepEqual(activity.askPending, { askedAt: 1_234 }, "the ask cycle is recorded");
+      assert.equal(activity.phase, "waiting");
+      assert.equal(activity.latestEvent, "ask_question");
+
+      // THE BUG: the sibling tool of the same parallel batch reports back and
+      // someone types into the pane. `latestEvent` must not be the ask's state.
+      currentNow = 3_000;
+      recorder.toolResult("call-2", "bash");
+      currentNow = 3_100;
+      recorder.toolExecutionEnd("call-2", "bash");
+      currentNow = 3_200;
+      recorder.input();
+      activity = readState();
+      assert.notEqual(activity.latestEvent, "ask_question", "telemetry really did move on");
+      assert.deepEqual(activity.askPending, { askedAt: 1_234 }, "the ask is still pending");
+
+      // Streaming telemetry is throttled, so this `messageUpdate` only mutates
+      // the in-memory state and defers the write; reading the file here would
+      // just re-read the previous snapshot. The deferred write itself is covered
+      // by `keeps askPending in the file the deferred throttled flush writes`.
+      currentNow = 3_300;
+      recorder.messageUpdate("tool_call");
+
+      currentNow = 4_000;
+      recorder.askAnswered();
+      activity = readState();
+      assert.equal(activity.askPending, null, "answered is an explicit clear");
+      assert.equal("askPending" in activity, true, "cleared is not the same as absent");
+      assert.notEqual(activity.latestEvent, "ask_question", "latestEvent is left to telemetry");
+
+      // Idempotent.
+      recorder.askAnswered();
+      assert.equal(readState().askPending, null);
+    });
+  });
+
+  it("keeps askPending in the file the deferred throttled flush writes", async () => {
+    // `messageUpdate` is throttled, so its mutation lands in the PENDING write
+    // rather than in the file: reading the file right after it would just
+    // re-read the previous snapshot, which carries the same marker and would
+    // make the assertion vacuous. Waiting for the real deferred timer is what
+    // proves a telemetry write cannot clear the ask marker.
+    const dir = createTestDir();
+    try {
+      await new Promise<void>((resolve) => {
+        let currentNow = 1_000;
+        const activityFile = getSubagentActivityFile(dir, "child-ask-throttled");
+        const recorder = createSubagentActivityRecorder({
+          runningChildId: "child-ask-throttled",
+          activityFile,
+          now: () => currentNow,
+        });
+
+        recorder.sessionStart();
+        currentNow = 2_000;
+        recorder.askQuestion(1_234);
+        // Still inside the throttle window: this update is deferred, not written.
+        currentNow = 2_100;
+        recorder.messageUpdate("tool_call");
+
+        setTimeout(() => {
+          const read = readSubagentActivityFile(activityFile, "child-ask-throttled");
+          assert.ok(read.ok, `activity should parse: ${(read as any).error}`);
+          assert.equal(
+            read.activity.latestEvent,
+            "message_update",
+            "the deferred flush really landed",
+          );
+          assert.deepEqual(
+            read.activity.askPending,
+            { askedAt: 1_234 },
+            "the telemetry write kept the ask marker",
+          );
+          resolve();
+        }, 650);
+      });
+    } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  it("clears askPending when the session finishes or shuts down", () => {
+    for (const ending of ["agentEndDone", "shutdownQuit", "shutdownReload"] as const) {
+      withTempDir((dir) => {
+        const runningChildId = `child-${ending}`;
+        const activityFile = getSubagentActivityFile(dir, runningChildId);
+        const recorder = createSubagentActivityRecorder({
+          runningChildId,
+          activityFile,
+          now: () => 1_000,
+        });
+        const readState = () => {
+          const result = readSubagentActivityFile(activityFile, runningChildId);
+          assert.ok(result.ok, `activity should parse: ${(result as any).error}`);
+          return result.activity;
+        };
+
+        recorder.sessionStart();
+        recorder.askQuestion(2_000);
+        assert.deepEqual(readState().askPending, { askedAt: 2_000 }, "parked before the ending");
+
+        if (ending === "agentEndDone") recorder.agentEndDone();
+        if (ending === "shutdownQuit") recorder.sessionShutdown("quit");
+        if (ending === "shutdownReload") recorder.sessionShutdown("reload");
+
+        const activity = readState();
+        assert.equal(activity.askPending, null, `${ending} must clear the ask marker`);
+        assert.equal(
+          "askPending" in activity,
+          true,
+          `${ending} writes it explicitly, so the parent never guesses from telemetry`,
+        );
+      });
+    }
+  });
+
+  it("parses and round-trips askPending, and keeps legacy files without the key valid", () => {
+    withTempDir((dir) => {
+      mkdirSync(join(dir, "subagent-activity"), { recursive: true });
+      const cases: Array<{ label: string; value: unknown; absent: boolean }> = [
+        { label: "absent (legacy child)", value: undefined, absent: true },
+        { label: "cleared", value: null, absent: false },
+        { label: "pending", value: { askedAt: 5 }, absent: false },
+      ];
+
+      for (const [index, testCase] of cases.entries()) {
+        const runningChildId = `child-ask-roundtrip-${index}`;
+        const activityFile = getSubagentActivityFile(dir, runningChildId);
+        const raw: Record<string, unknown> = validActivity({ runningChildId });
+        if (!testCase.absent) raw.askPending = testCase.value;
+        writeFileSync(activityFile, `${JSON.stringify(raw)}\n`);
+
+        const read = readSubagentActivityFile(activityFile, runningChildId);
+        assert.ok(read.ok, `${testCase.label} must parse: ${(read as any).error}`);
+        assert.equal(
+          "askPending" in read.activity,
+          !testCase.absent,
+          `${testCase.label}: key presence survives the validator`,
+        );
+        if (!testCase.absent) {
+          assert.deepEqual(read.activity.askPending, testCase.value, testCase.label);
+        }
+
+        // Round-trip: the parsed state re-serializes into the same three states.
+        writeSubagentActivityFile(activityFile, read.activity);
+        const again = readSubagentActivityFile(activityFile, runningChildId);
+        assert.ok(again.ok, `${testCase.label} must round-trip`);
+        assert.equal(
+          "askPending" in again.activity,
+          !testCase.absent,
+          `${testCase.label}: round-trip keeps key presence`,
+        );
+        if (!testCase.absent) assert.deepEqual(again.activity.askPending, testCase.value);
+      }
     });
   });
 
@@ -8645,6 +9184,181 @@ describe("subagent interruption", () => {
         { askedAt: 9, text: "the answer" },
       );
     } finally {
+      rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  // --- Where the parent decides: pane or reply sidecar? --------------------
+  // The rule is `existsSync(.ask) && childIsAsking(running)`, and `childIsAsking`
+  // must trust the child's authoritative `askPending` marker over `latestEvent`.
+  // Deriving it from telemetry deadlocked the child: ask_question in the same
+  // assistant message as another tool means the sibling's tool_result /
+  // tool_execution_end (or text typed into the pane -> input) overwrites
+  // `latestEvent` while the ask is still parked, the parent types the reply into
+  // the pane, pi cannot deliver steering text into a pending tool call, and the
+  // child hangs until its timeout while subagent_message reports "Reply
+  // delivered".
+  function writeParkedActivity(
+    activityFile: string,
+    overrides: Record<string, unknown> = {},
+  ): void {
+    writeFileSync(
+      activityFile,
+      JSON.stringify({
+        version: 1,
+        runningChildId: "a1",
+        createdAt: 1_000,
+        updatedAt: 2_000,
+        sequence: 4,
+        latestEvent: "ask_question",
+        phase: "waiting",
+        agentActive: true,
+        turnActive: true,
+        providerActive: false,
+        toolActive: false,
+        waitingSince: 2_000,
+        ...overrides,
+      }),
+    );
+  }
+
+  it("routes the reply off askPending even after sibling telemetry moved latestEvent off ask_question", () => {
+    const testApi = (subagentsModule as any).__test__;
+    for (const siblingEvent of ["tool_result", "tool_execution_end", "input", "message_update"]) {
+      withTempDir((dir) => {
+        const sessionFile = join(dir, "s.jsonl");
+        const activityFile = join(dir, "activity.json");
+        writeParkedActivity(activityFile, {
+          latestEvent: siblingEvent,
+          askPending: { askedAt: 9 },
+        });
+        writeFileSync(
+          `${sessionFile}.ask`,
+          JSON.stringify({ name: "Worker", agent: "scout", question: "q?", askedAt: 9 }),
+        );
+        const running = makeRunning({ sessionFile, activityFile });
+        const sent: string[] = [];
+
+        const result = testApi.deliverSubagentSteer(running, "the answer", (surface, text) => {
+          sent.push(text);
+        });
+
+        assert.deepEqual(
+          result,
+          { mode: "reply" },
+          `a parked ask stays routable after ${siblingEvent}`,
+        );
+        assert.deepEqual(sent, [], `nothing typed into the pane after ${siblingEvent}`);
+        assert.deepEqual(
+          JSON.parse(readFileSync(`${sessionFile}.ask-reply`, "utf8")),
+          { askedAt: 9, text: "the answer" },
+          "the wire format (askedAt echoed from .ask) is unchanged",
+        );
+      });
+    }
+  });
+
+  it("trusts an explicit askPending null over legacy ask_question telemetry", () => {
+    // The child aborted/timed out/consumed its ask: the marker says so
+    // explicitly, and that outranks a `latestEvent` still parked on
+    // ask_question. Otherwise a plain steer would be swallowed by the sidecar.
+    const testApi = (subagentsModule as any).__test__;
+    withTempDir((dir) => {
+      const sessionFile = join(dir, "s.jsonl");
+      const activityFile = join(dir, "activity.json");
+      writeParkedActivity(activityFile, { askPending: null });
+      writeFileSync(
+        `${sessionFile}.ask`,
+        JSON.stringify({ name: "Worker", agent: "scout", question: "q?", askedAt: 9 }),
+      );
+      const sent: string[] = [];
+
+      const result = testApi.deliverSubagentSteer(
+        makeRunning({ sessionFile, activityFile }),
+        "keep going",
+        (surface, text) => {
+          sent.push(text);
+        },
+      );
+
+      assert.deepEqual(result, { mode: "typed" });
+      assert.deepEqual(sent, ["keep going"]);
+      assert.ok(!existsSync(`${sessionFile}.ask-reply`), "no reply sidecar written");
+    });
+  });
+
+  it("falls back to the legacy latestEvent check for a child that predates askPending", () => {
+    const testApi = (subagentsModule as any).__test__;
+    const cases: Array<{ latestEvent: string; mode: string }> = [
+      { latestEvent: "ask_question", mode: "reply" },
+      { latestEvent: "tool_execution_end", mode: "typed" },
+    ];
+    for (const testCase of cases) {
+      withTempDir((dir) => {
+        const sessionFile = join(dir, "s.jsonl");
+        const activityFile = join(dir, "activity.json");
+        // No `askPending` key at all: an activity file from an older child.
+        writeParkedActivity(activityFile, {
+          latestEvent: testCase.latestEvent,
+          phase: testCase.latestEvent === "ask_question" ? "waiting" : "active",
+        });
+        writeFileSync(
+          `${sessionFile}.ask`,
+          JSON.stringify({ name: "Worker", agent: "scout", question: "q?", askedAt: 9 }),
+        );
+        const sent: string[] = [];
+
+        const result = testApi.deliverSubagentSteer(
+          makeRunning({ sessionFile, activityFile }),
+          "the answer",
+          (surface, text) => {
+            sent.push(text);
+          },
+        );
+
+        assert.deepEqual(
+          result,
+          { mode: testCase.mode },
+          `legacy ${testCase.latestEvent} falls back to the telemetry heuristic`,
+        );
+        assert.equal(sent.length, testCase.mode === "typed" ? 1 : 0);
+      });
+    }
+  });
+
+  it("handleSubagentSteer: askPending routes the orchestrator's message to the reply sidecar", () => {
+    // The end-to-end symptom of the deadlock: subagent_message must ack a real
+    // reply delivery, not report success after typing into a parked child.
+    const testApi = (subagentsModule as any).__test__;
+    const runningMap = testApi.runningSubagents as Map<string, any>;
+    const dir = createTestDir();
+    runningMap.clear();
+    try {
+      const sessionFile = join(dir, "s.jsonl");
+      const activityFile = join(dir, "activity.json");
+      writeParkedActivity(activityFile, { latestEvent: "tool_result", askPending: { askedAt: 3 } });
+      writeFileSync(
+        `${sessionFile}.ask`,
+        JSON.stringify({ name: "Worker", agent: "scout", question: "q?", askedAt: 3 }),
+      );
+      runningMap.set("a1", makeRunning({ sessionFile, activityFile }));
+      let typed = "";
+
+      const result = testApi.handleSubagentSteer(
+        { name: "Worker", message: "the answer" },
+        (surface, text) => {
+          typed = text;
+        },
+      );
+
+      assert.equal(typed, "", "nothing typed into the pane");
+      assert.match(result.content[0].text, /Reply delivered to subagent "Worker"/);
+      assert.deepEqual(
+        JSON.parse(readFileSync(`${sessionFile}.ask-reply`, "utf8")),
+        { askedAt: 3, text: "the answer" },
+      );
+    } finally {
+      runningMap.clear();
       rmSync(dir, { recursive: true, force: true });
     }
   });
