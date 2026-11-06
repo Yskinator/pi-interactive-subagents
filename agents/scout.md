@@ -1,6 +1,6 @@
 ---
 name: scout
-description: Fast codebase recon — explores files, finds patterns, maps architecture
+description: Fast codebase recon — explores files, finds patterns, maps architecture. Read-only, no bash tool
 tools: read, grep, find, ls
 model: vllm/qwen3.8-flash-next
 thinking: low
